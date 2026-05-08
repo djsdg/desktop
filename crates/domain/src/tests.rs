@@ -45,6 +45,7 @@ fn constructs_schema_backed_entities() {
         SessionId::new("session-1"),
         task.id.clone(),
         "codex",
+        Some("agent-session-1".to_string()),
         SessionStatus::Running,
     );
 
@@ -109,6 +110,7 @@ fn constructs_schema_backed_entities() {
             id: SessionId::new("session-1"),
             task_id: TaskId::new("task-1"),
             agent_id: "codex".to_string(),
+            agent_session_id: Some("agent-session-1".to_string()),
             status: SessionStatus::Running,
         }
     );

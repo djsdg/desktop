@@ -42,6 +42,7 @@ CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
     agent_id TEXT NOT NULL,
+    agent_session_id TEXT,
     status INTEGER NOT NULL DEFAULT 0 -- 0: running, 1: stopped
 );
 

@@ -41,20 +41,24 @@ pub struct Session {
     pub id: crate::SessionId,
     pub task_id: TaskId,
     pub agent_id: String,
+    pub agent_session_id: Option<String>,
     pub status: SessionStatus,
 }
 
 impl Session {
+    /// Creates a session snapshot that keeps both the logical agent identity and any provider session id.
     pub fn new(
         id: crate::SessionId,
         task_id: TaskId,
         agent_id: impl Into<String>,
+        agent_session_id: Option<String>,
         status: SessionStatus,
     ) -> Self {
         Self {
             id,
             task_id,
             agent_id: agent_id.into(),
+            agent_session_id,
             status,
         }
     }
