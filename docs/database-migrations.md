@@ -17,3 +17,14 @@ The bootstrapper compares the applied rows in `migrations` with the active targe
 - If the shared prefix diverges, bootstrap fails instead of guessing at repair.
 
 Because rollback needs access to `down` SQL, retired tail migrations should remain defined in Rust until every managed database has been reconciled to the shorter target prefix.
+
+## Operational Logging
+
+`ora-db` emits structured `tracing` events during database bootstrap and reconciliation.
+
+- Database open and bootstrap lifecycle events include an `operation` field and the storage `location`.
+- Reconciliation decision events report the applied and target migration counts plus any pending upgrade or rollback work.
+- Migration execution events include `migration_version` and `direction`.
+- Migration failures log at `ERROR` and place failure details under `error` before returning the original `DatabaseError`.
+
+The JSON envelope and sink behavior are owned by `ora-logging`; `ora-db` only emits structured events.

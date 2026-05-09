@@ -1,3 +1,4 @@
+use ora_logging::{ora_error, ora_info};
 use rusqlite::{Connection, Transaction, params};
 
 use crate::{DatabaseError, MigrationCatalog, MigrationDirection, TimestampSource};
@@ -25,6 +26,21 @@ where
     let applied_migrations = load_applied_migrations(connection)?;
     let target_versions = catalog.target_versions();
     let shared_prefix_length = applied_migrations.len().min(target_versions.len());
+    let pending_up_count = target_versions
+        .len()
+        .saturating_sub(applied_migrations.len());
+    let pending_down_count = applied_migrations
+        .len()
+        .saturating_sub(target_versions.len());
+
+    ora_info!(
+        message = "evaluated migration reconciliation",
+        operation = "migration_reconciliation",
+        applied_migration_count = applied_migrations.len(),
+        target_migration_count = target_versions.len(),
+        pending_up_count,
+        pending_down_count
+    );
 
     for (position, (applied, expected)) in applied_migrations
         .iter()
@@ -33,6 +49,16 @@ where
         .enumerate()
     {
         if applied.version != *expected {
+            ora_error!(
+                message = "migration history diverged",
+                operation = "migration_reconciliation",
+                migration_position = position,
+                error.kind = "diverged_migration_history",
+                error.message = format!(
+                    "expected migration version {expected}, found {}",
+                    applied.version
+                )
+            );
             return Err(DatabaseError::DivergedMigrationHistory {
                 position,
                 expected: (*expected).to_string(),
@@ -42,11 +68,30 @@ where
     }
 
     if applied_migrations.len() > target_versions.len() {
+        ora_info!(
+            message = "rolling back trailing migrations",
+            operation = "migration_reconciliation",
+            rollback_count = pending_down_count
+        );
+
         for applied_migration in applied_migrations.iter().skip(target_versions.len()).rev() {
             let migration = catalog
                 .migration(&applied_migration.version)
-                .ok_or_else(|| DatabaseError::UnknownAppliedMigrationVersion {
-                    version: applied_migration.version.clone(),
+                .ok_or_else(|| {
+                    ora_error!(
+                        message = "encountered unknown applied migration version",
+                        operation = "migration_reconciliation",
+                        migration_version = applied_migration.version.clone(),
+                        error.kind = "unknown_applied_migration_version",
+                        error.message = format!(
+                            "database contains unknown applied migration version {}",
+                            applied_migration.version
+                        )
+                    );
+
+                    DatabaseError::UnknownAppliedMigrationVersion {
+                        version: applied_migration.version.clone(),
+                    }
                 })?;
 
             execute_migration_step(
@@ -67,8 +112,25 @@ where
     }
 
     if target_versions.len() > applied_migrations.len() {
+        ora_info!(
+            message = "applying pending migrations",
+            operation = "migration_reconciliation",
+            apply_count = pending_up_count
+        );
+
         for target_version in target_versions.iter().skip(applied_migrations.len()) {
             let migration = catalog.migration(target_version).ok_or_else(|| {
+                ora_error!(
+                    message = "target migration version is missing from the catalog",
+                    operation = "migration_reconciliation",
+                    migration_version = (*target_version).to_string(),
+                    error.kind = "unknown_applied_migration_version",
+                    error.message = format!(
+                        "target migration version {} is missing from the catalog",
+                        target_version
+                    )
+                );
+
                 DatabaseError::UnknownAppliedMigrationVersion {
                     version: (*target_version).to_string(),
                 }
@@ -92,6 +154,13 @@ where
                 },
             )?;
         }
+    }
+
+    if pending_up_count == 0 && pending_down_count == 0 {
+        ora_info!(
+            message = "database schema already matches the target migration prefix",
+            operation = "migration_reconciliation"
+        );
     }
 
     Ok(())
@@ -131,11 +200,27 @@ fn execute_migration_step<F>(
 where
     F: FnOnce(&Transaction<'_>) -> Result<(), rusqlite::Error>,
 {
+    ora_info!(
+        message = "executing migration step",
+        operation = "migration_execute",
+        migration_version = version.to_string(),
+        direction = direction.to_string()
+    );
+
     let transaction = connection.transaction()?;
 
     for statement in statements {
         // Running each statement separately makes the failing direction and version easier to report.
         transaction.execute_batch(statement).map_err(|source| {
+            ora_error!(
+                message = "migration step failed",
+                operation = "migration_execute",
+                migration_version = version.to_string(),
+                direction = direction.to_string(),
+                error.kind = "migration_step_failed",
+                error.message = source.to_string()
+            );
+
             DatabaseError::MigrationStepFailed {
                 version: version.to_string(),
                 direction,
@@ -144,12 +229,30 @@ where
         })?;
     }
 
-    finalize(&transaction).map_err(|source| DatabaseError::MigrationStepFailed {
-        version: version.to_string(),
-        direction,
-        source,
+    finalize(&transaction).map_err(|source| {
+        ora_error!(
+            message = "migration bookkeeping failed",
+            operation = "migration_execute",
+            migration_version = version.to_string(),
+            direction = direction.to_string(),
+            error.kind = "migration_step_failed",
+            error.message = source.to_string()
+        );
+
+        DatabaseError::MigrationStepFailed {
+            version: version.to_string(),
+            direction,
+            source,
+        }
     })?;
     transaction.commit()?;
+
+    ora_info!(
+        message = "executed migration step",
+        operation = "migration_execute",
+        migration_version = version.to_string(),
+        direction = direction.to_string()
+    );
 
     Ok(())
 }

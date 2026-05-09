@@ -11,9 +11,12 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+ora-logging = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled"] }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }

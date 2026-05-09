@@ -1,8 +1,13 @@
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use pretty_assertions::assert_eq;
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
+use tracing_subscriber::layer::{Context, Layer};
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::registry::LookupSpan;
 
 use crate::{
     AppliedMigration, DatabaseBootstrapper, DatabaseError, DatabaseLocation, Migration,
@@ -208,6 +213,87 @@ fn leaves_failed_down_migration_recorded() {
     );
 }
 
+/// Verifies bootstrap and migration reconciliation emit structured success and failure events.
+#[test]
+fn emits_structured_bootstrap_and_migration_events() {
+    let success_recorder = EventRecorder::default();
+    let success_subscriber = tracing_subscriber::registry().with(success_recorder.layer());
+
+    tracing::subscriber::with_default(success_subscriber, || {
+        DatabaseBootstrapper::new(FixedTimestampSource { now: 42 })
+            .bootstrap(
+                &DatabaseLocation::in_memory(),
+                &default_migration_catalog().unwrap(),
+            )
+            .unwrap();
+    });
+
+    assert_eq!(
+        success_recorder.events().into_iter().any(|event| {
+            event_has_fields(
+                &event,
+                &[
+                    ("location", "in_memory"),
+                    ("method", "bootstrap"),
+                    ("message", "database bootstrap complete"),
+                    ("operation", "database_bootstrap"),
+                ],
+            )
+        }),
+        true
+    );
+
+    let failure_recorder = EventRecorder::default();
+    let failure_subscriber = tracing_subscriber::registry().with(failure_recorder.layer());
+    let temp_dir = TempDir::new().unwrap();
+    let database_path = temp_dir.path().join("failed-up.sqlite3");
+
+    bootstrap_file_database(
+        &database_path,
+        MigrationCatalog::new(vec![create_table_migration("0001", "alpha")]).unwrap(),
+        700,
+    );
+    tracing::subscriber::with_default(failure_subscriber, || {
+        let error = DatabaseBootstrapper::new(FixedTimestampSource { now: 800 }).bootstrap(
+            &DatabaseLocation::path(&database_path),
+            &MigrationCatalog::new(vec![
+                create_table_migration("0001", "alpha"),
+                broken_up_migration("0002"),
+            ])
+            .unwrap(),
+        );
+
+        assert_eq!(
+            matches!(
+                error,
+                Err(DatabaseError::MigrationStepFailed {
+                    version,
+                    direction: MigrationDirection::Up,
+                    ..
+                }) if version == "0002"
+            ),
+            true
+        );
+    });
+
+    assert_eq!(
+        failure_recorder.events().into_iter().any(|event| {
+            event_has_fields(
+                &event,
+                &[
+                    ("direction", "up"),
+                    ("error.kind", "migration_step_failed"),
+                    ("message", "migration step failed"),
+                    ("method", "execute_migration_step"),
+                    ("migration_version", "0002"),
+                    ("operation", "migration_execute"),
+                ],
+            )
+        }),
+        true
+    );
+}
+
 /// Opens a file-backed database through the bootstrapper and drops the handle once reconciliation finishes.
 fn bootstrap_file_database(path: &Path, catalog: MigrationCatalog, now: i64) {
     DatabaseBootstrapper::new(FixedTimestampSource { now })
@@ -325,6 +411,97 @@ fn create_table_migration(version: &'static str, table_name: &'static str) -> Mi
     let down_statements = Box::leak(vec![down_sql as &'static str].into_boxed_slice());
 
     Migration::new(version, up_statements, down_statements)
+}
+
+/// Reports whether one recorded event includes all expected field/value pairs.
+fn event_has_fields(event: &LoggedEvent, expected_fields: &[(&str, &str)]) -> bool {
+    expected_fields.iter().all(|(field_name, expected_value)| {
+        event.fields.get(*field_name).map(String::as_str) == Some(*expected_value)
+    })
+}
+
+/// Captures one emitted event in a comparison-friendly structure for database logging assertions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoggedEvent {
+    level: String,
+    target: String,
+    fields: BTreeMap<String, String>,
+}
+
+/// Records tracing events into shared memory so database tests can assert structured outcomes.
+#[derive(Clone, Debug, Default)]
+struct EventRecorder {
+    events: Arc<Mutex<Vec<LoggedEvent>>>,
+}
+
+impl EventRecorder {
+    /// Builds the recording layer attached to one scoped test subscriber.
+    fn layer(&self) -> RecordingLayer {
+        RecordingLayer {
+            events: self.events.clone(),
+        }
+    }
+
+    /// Returns every captured event in emission order.
+    fn events(&self) -> Vec<LoggedEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+/// Pushes each tracing event into the shared recorder without relying on global subscriber state.
+#[derive(Clone, Debug)]
+struct RecordingLayer {
+    events: Arc<Mutex<Vec<LoggedEvent>>>,
+}
+
+impl<S> Layer<S> for RecordingLayer
+where
+    S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    /// Converts each event into a stable, fully comparable structure for test assertions.
+    fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+        let mut visitor = EventFieldVisitor::default();
+        event.record(&mut visitor);
+        self.events.lock().unwrap().push(LoggedEvent {
+            level: event.metadata().level().to_string(),
+            target: event.metadata().target().to_string(),
+            fields: visitor.fields,
+        });
+    }
+}
+
+/// Records tracing fields as strings because these tests care about semantic content, not JSON formatting.
+#[derive(Debug, Default)]
+struct EventFieldVisitor {
+    fields: BTreeMap<String, String>,
+}
+
+impl tracing::field::Visit for EventFieldVisitor {
+    /// Preserves string fields exactly as database logs emitted them.
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    /// Preserves signed integers in decimal form for stable assertions.
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    /// Preserves unsigned integers in decimal form for stable assertions.
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    /// Falls back to debug formatting for field types without a more specific visitor hook.
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.fields.insert(
+            field.name().to_string(),
+            format!("{value:?}").trim_matches('"').to_string(),
+        );
+    }
 }
 
 /// Builds a migration whose `up` SQL fails immediately so transaction rollback behavior can be asserted.

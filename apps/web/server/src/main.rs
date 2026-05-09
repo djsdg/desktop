@@ -9,8 +9,15 @@ use ora_contracts::{
     UpdateProjectRequest, UpdateProjectResponse,
 };
 use ora_domain::{Project, ProjectId};
+use ora_logging::{
+    FileLoggingConfig, LogLevel, LogOutput, LoggingConfig, LoggingGuard, RotationPolicy,
+    init_logging,
+};
 use std::cell::RefCell;
+use std::env;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
+use thiserror::Error;
 
 /// Groups the transport-facing project entry points for the web adapter.
 pub struct WebProjectApi<Repository, IdGenerator, ClockSource> {
@@ -189,7 +196,90 @@ fn build_web_project_api()
     )
 }
 
-/// Boots the web adapter with the application-layer project API wiring.
-fn main() {
+/// Loads the logging configuration from the environment contract defined for the web server bootstrap.
+fn read_logging_config() -> Result<LoggingConfig, WebBootstrapError> {
+    let level = match env::var("ORA_LOG_LEVEL")
+        .unwrap_or_else(|_| "info".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "debug" => LogLevel::Debug,
+        "info" => LogLevel::Info,
+        "warn" => LogLevel::Warn,
+        "error" => LogLevel::Error,
+        value => {
+            return Err(WebBootstrapError::InvalidLogLevel {
+                value: value.to_string(),
+            });
+        }
+    };
+    let file_config = FileLoggingConfig::new(
+        env::var("ORA_LOG_PATH").unwrap_or_else(|_| "./ora.log".to_string()),
+        RotationPolicy::Daily,
+        read_log_max_days()?,
+    );
+    let output = match env::var("ORA_LOG_MODE")
+        .unwrap_or_else(|_| "stdout".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "stdout" => LogOutput::Stdout,
+        "file" => LogOutput::File(file_config),
+        "stdout_and_file" => LogOutput::StdoutAndFile(file_config),
+        value => {
+            return Err(WebBootstrapError::InvalidLogMode {
+                value: value.to_string(),
+            });
+        }
+    };
+
+    Ok(LoggingConfig::new(level, output))
+}
+
+/// Parses the configured retention window and rejects zero-day values explicitly.
+fn read_log_max_days() -> Result<NonZeroUsize, WebBootstrapError> {
+    let raw_value = env::var("ORA_LOG_MAX_DAYS").unwrap_or_else(|_| "3".to_string());
+    let parsed_value =
+        raw_value
+            .parse::<usize>()
+            .map_err(|source| WebBootstrapError::InvalidLogMaxDays {
+                value: raw_value.clone(),
+                source,
+            })?;
+
+    NonZeroUsize::new(parsed_value).ok_or(WebBootstrapError::InvalidLogMaxDaysZero)
+}
+
+/// Boots the web adapter with shared logging plus the application-layer project API wiring.
+fn main() -> Result<(), WebBootstrapError> {
+    let _logging_guard = initialize_logging()?;
     let _web_project_api = build_web_project_api();
+
+    Ok(())
+}
+
+/// Initializes structured logging during process bootstrap and returns the guard that owns writer lifetimes.
+fn initialize_logging() -> Result<LoggingGuard, WebBootstrapError> {
+    let config = read_logging_config()?;
+
+    init_logging(config).map_err(WebBootstrapError::LoggingInit)
+}
+
+/// Reports bootstrap-time configuration and logging failures for the web server entry point.
+#[derive(Debug, Error)]
+enum WebBootstrapError {
+    #[error("invalid ORA_LOG_LEVEL value `{value}`")]
+    InvalidLogLevel { value: String },
+    #[error("invalid ORA_LOG_MODE value `{value}`")]
+    InvalidLogMode { value: String },
+    #[error("invalid ORA_LOG_MAX_DAYS value `{value}`")]
+    InvalidLogMaxDays {
+        value: String,
+        #[source]
+        source: std::num::ParseIntError,
+    },
+    #[error("ORA_LOG_MAX_DAYS must be greater than zero")]
+    InvalidLogMaxDaysZero,
+    #[error(transparent)]
+    LoggingInit(#[from] ora_logging::LoggingInitError),
 }
