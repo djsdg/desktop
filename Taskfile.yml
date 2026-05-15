@@ -1,16 +1,10 @@
-version: '3'
-
-vars:
-  # Get the list of all local crates, excluding the target directory.
-  # You can also set it manually: CRATES: crate_a crate_b
-  CRATES:
-    sh: cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name'
+version: "3"
 
 tasks:
   default:
     cmds:
       - task: list
-  
+
   install:
     desc: Install all dependencies for the project
     cmds:
@@ -22,7 +16,7 @@ tasks:
     desc: List all tasks in the current project
     cmds:
       - task --list
-  
+
   lint:
     desc: Run linters on all crates
     silent: true
@@ -52,6 +46,6 @@ tasks:
     desc: Clean build artifacts
     cmds:
       - rm -rf node_modules
-      - pnpm -r exec -- rm -rf node_modules
+      - pnpm -r exec -- pnpm pm clean
       - pnpm store prune
       - cargo clean
