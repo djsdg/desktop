@@ -1,19 +1,33 @@
 use crate::app_state::AppState;
-use crate::config::RuntimeConfig;
+use crate::config::{ProjectConfig, RuntimeConfig};
 use crate::error::WebBootstrapError;
 use crate::service::{ProjectApi, SessionApi, TaskApi, WorktreeApi};
-use ora_application::Clock;
+use ora_application::{
+    Clock, ProjectIdGenerator, ProjectRepository, ProjectRepositoryError, UuidProjectIdGenerator,
+};
 use ora_db::{DatabaseBootstrapper, DatabaseLocation, RepositoryPool, default_migration_catalog};
+use ora_domain::{AuditFields, Project};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Builds the application state used by the web runtime from SQLite-backed dependencies.
 pub fn build_app_state(runtime_config: &RuntimeConfig) -> Result<AppState, WebBootstrapError> {
-    build_app_state_for_database(runtime_config.database().path())
+    let pool = build_repository_pool(runtime_config.database().path())?;
+    let clock = SystemClock;
+
+    reconcile_configured_project(&pool, runtime_config.project(), clock)?;
+
+    Ok(AppState::new(
+        Arc::new(ProjectApi::new(pool.clone(), clock)),
+        Arc::new(TaskApi::new(pool.clone(), clock)),
+        Arc::new(WorktreeApi::new(pool.clone(), clock)),
+        Arc::new(SessionApi::new(pool, clock)),
+    ))
 }
 
-/// Builds the application state used by tests and the runtime from one database path.
+/// Builds application state for tests that need SQLite-backed handlers without project reconciliation.
+#[cfg(test)]
 pub(crate) fn build_app_state_for_database(
     database_path: &Path,
 ) -> Result<AppState, WebBootstrapError> {
@@ -28,6 +42,53 @@ pub(crate) fn build_app_state_for_database(
     ))
 }
 
+/// Ensures the configured workspace project exists in persistent storage before readiness.
+fn reconcile_configured_project(
+    pool: &RepositoryPool,
+    project_config: &ProjectConfig,
+    clock: SystemClock,
+) -> Result<(), WebBootstrapError> {
+    let repository = ora_db::SqliteProjectRepository::new(pool.clone());
+    let configured_project_path = project_config.path().to_string_lossy().to_string();
+    let existing_project = repository
+        .find_project_by_name(project_config.name())
+        .map_err(project_bootstrap_error)?;
+
+    match existing_project {
+        Some(existing_project) if existing_project.root_path == configured_project_path => Ok(()),
+        Some(existing_project) => {
+            let updated_at = clock.now_timestamp_millis();
+
+            repository
+                .update_project(Project::new(
+                    existing_project.id,
+                    existing_project.name,
+                    configured_project_path,
+                    AuditFields::new(
+                        existing_project.audit_fields.created_at,
+                        updated_at,
+                        existing_project.audit_fields.is_deleted,
+                    ),
+                ))
+                .map(|_| ())
+                .map_err(project_bootstrap_error)
+        }
+        None => {
+            let now = clock.now_timestamp_millis();
+
+            repository
+                .create_project(Project::new(
+                    UuidProjectIdGenerator::new().generate_project_id(),
+                    project_config.name(),
+                    configured_project_path,
+                    AuditFields::new(now, now, false),
+                ))
+                .map(|_| ())
+                .map_err(project_bootstrap_error)
+        }
+    }
+}
+
 /// Opens the configured file-backed SQLite database and returns the shared repository pool.
 fn build_repository_pool(database_path: &Path) -> Result<RepositoryPool, WebBootstrapError> {
     let catalog = default_migration_catalog().map_err(WebBootstrapError::DatabaseBootstrap)?;
@@ -35,6 +96,15 @@ fn build_repository_pool(database_path: &Path) -> Result<RepositoryPool, WebBoot
     DatabaseBootstrapper::system()
         .bootstrap_repository_pool(&DatabaseLocation::path(database_path), &catalog)
         .map_err(WebBootstrapError::DatabaseBootstrap)
+}
+
+/// Converts repository-owned bootstrap failures into one stable startup error variant.
+fn project_bootstrap_error(error: ProjectRepositoryError) -> WebBootstrapError {
+    match error {
+        ProjectRepositoryError::OperationFailed(message) => {
+            WebBootstrapError::ProjectBootstrap { message }
+        }
+    }
 }
 
 /// Reads the current wall-clock time for audit fields in the runtime.
@@ -53,8 +123,17 @@ impl Clock for SystemClock {
 
 #[cfg(test)]
 mod tests {
-    use super::build_app_state_for_database;
+    use super::{build_app_state, build_app_state_for_database};
+    use crate::config::RuntimeConfig;
     use crate::error::WebBootstrapError;
+    use ora_application::ProjectRepository;
+    use ora_db::{
+        DatabaseBootstrapper, DatabaseLocation, SqliteProjectRepository, default_migration_catalog,
+    };
+    use pretty_assertions::assert_eq;
+    use std::path::Path;
+    use std::thread;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     /// Verifies bootstrap fails cleanly when the configured database path points to a directory.
@@ -67,5 +146,128 @@ mod tests {
         };
 
         assert!(matches!(error, WebBootstrapError::DatabaseBootstrap(_)));
+    }
+
+    /// Verifies runtime bootstrap creates the configured project when no visible row exists yet.
+    #[test]
+    fn creates_configured_project_during_bootstrap() {
+        let temp_dir = TempDir::new().unwrap();
+        let database_path = temp_dir.path().join("bootstrap-create.sqlite3");
+        let runtime_config = runtime_config(&database_path, "Ora", "/workspace/ora");
+
+        build_app_state(&runtime_config)
+            .unwrap_or_else(|error| panic!("expected runtime bootstrap to succeed: {error}"));
+
+        let repository = bootstrapped_project_repository(&database_path);
+
+        assert_eq!(
+            repository
+                .find_project_by_name("Ora")
+                .unwrap()
+                .map(|project| (
+                    project.name,
+                    project.root_path,
+                    project.audit_fields.is_deleted,
+                )),
+            Some(("Ora".to_string(), "/workspace/ora".to_string(), false))
+        );
+    }
+
+    /// Verifies runtime bootstrap leaves an already reconciled configured project unchanged.
+    #[test]
+    fn keeps_configured_project_unchanged_when_name_and_path_match() {
+        let temp_dir = TempDir::new().unwrap();
+        let database_path = temp_dir.path().join("bootstrap-noop.sqlite3");
+        let runtime_config = runtime_config(&database_path, "Ora", "/workspace/ora");
+
+        build_app_state(&runtime_config)
+            .unwrap_or_else(|error| panic!("expected first runtime bootstrap to succeed: {error}"));
+        let repository = bootstrapped_project_repository(&database_path);
+        let original_project = repository
+            .find_project_by_name("Ora")
+            .unwrap()
+            .unwrap_or_else(|| panic!("expected configured project to exist after bootstrap"));
+
+        build_app_state(&runtime_config).unwrap_or_else(|error| {
+            panic!("expected second runtime bootstrap to succeed: {error}")
+        });
+        let repository = bootstrapped_project_repository(&database_path);
+
+        assert_eq!(
+            repository.find_project_by_name("Ora").unwrap(),
+            Some(original_project)
+        );
+    }
+
+    /// Verifies runtime bootstrap repairs path drift without replacing the persisted project identity.
+    #[test]
+    fn updates_configured_project_path_when_storage_drifts() {
+        let temp_dir = TempDir::new().unwrap();
+        let database_path = temp_dir.path().join("bootstrap-update.sqlite3");
+        let original_runtime_config = runtime_config(&database_path, "Ora", "/workspace/ora");
+
+        build_app_state(&original_runtime_config)
+            .unwrap_or_else(|error| panic!("expected first runtime bootstrap to succeed: {error}"));
+        let repository = bootstrapped_project_repository(&database_path);
+        let original_project = repository
+            .find_project_by_name("Ora")
+            .unwrap()
+            .unwrap_or_else(|| panic!("expected configured project to exist after bootstrap"));
+
+        thread::sleep(Duration::from_millis(2));
+
+        let updated_runtime_config =
+            runtime_config(&database_path, "Ora", "/workspace/ora-renamed");
+        build_app_state(&updated_runtime_config).unwrap_or_else(|error| {
+            panic!("expected second runtime bootstrap to succeed: {error}")
+        });
+        let repository = bootstrapped_project_repository(&database_path);
+        let updated_project = repository
+            .find_project_by_name("Ora")
+            .unwrap()
+            .unwrap_or_else(|| panic!("expected configured project to exist after path update"));
+
+        assert_eq!(updated_project.id, original_project.id);
+        assert_eq!(updated_project.name, original_project.name);
+        assert_eq!(
+            updated_project.root_path,
+            "/workspace/ora-renamed".to_string()
+        );
+        assert_eq!(
+            updated_project.audit_fields.created_at,
+            original_project.audit_fields.created_at
+        );
+        assert!(
+            updated_project.audit_fields.updated_at >= original_project.audit_fields.updated_at
+        );
+    }
+
+    /// Builds one runtime configuration without mutating process environment during tests.
+    fn runtime_config(
+        database_path: &Path,
+        project_name: &str,
+        project_path: &str,
+    ) -> RuntimeConfig {
+        RuntimeConfig::from_reader(|key| match key {
+            "ORA_DB_PATH" => Some(database_path.to_string_lossy().to_string()),
+            "ORA_PROJECT_NAME" => Some(project_name.to_string()),
+            "ORA_PROJECT_PATH" => Some(project_path.to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|error| panic!("expected runtime configuration to load: {error}"))
+    }
+
+    /// Opens the test database so bootstrap assertions can inspect persisted project state.
+    fn bootstrapped_project_repository(database_path: &Path) -> SqliteProjectRepository {
+        let pool = DatabaseBootstrapper::system()
+            .bootstrap_repository_pool(
+                &DatabaseLocation::path(database_path),
+                &default_migration_catalog().unwrap(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("expected repository pool bootstrap to succeed: {error}")
+            });
+
+        SqliteProjectRepository::new(pool)
     }
 }

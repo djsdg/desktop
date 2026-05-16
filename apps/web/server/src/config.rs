@@ -5,6 +5,16 @@ use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+const DATABASE_PATH_ENV_VAR: &str = "ORA_DB_PATH";
+const PROJECT_NAME_ENV_VAR: &str = "ORA_PROJECT_NAME";
+const PROJECT_PATH_ENV_VAR: &str = "ORA_PROJECT_PATH";
+const HOST_ENV_VAR: &str = "ORA_HOST";
+const PORT_ENV_VAR: &str = "ORA_PORT";
+const LOG_LEVEL_ENV_VAR: &str = "ORA_LOG_LEVEL";
+const LOG_MODE_ENV_VAR: &str = "ORA_LOG_MODE";
+const LOG_PATH_ENV_VAR: &str = "ORA_LOG_PATH";
+const LOG_MAX_DAYS_ENV_VAR: &str = "ORA_LOG_MAX_DAYS";
+
 const DEFAULT_DATABASE_PATH: &str = "./ora.sqlite3";
 const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 32578;
@@ -16,6 +26,7 @@ const DEFAULT_LOG_MAX_DAYS: &str = "3";
 /// Groups the runtime configuration required to bootstrap the web server process.
 pub struct RuntimeConfig {
     database: DatabaseConfig,
+    project: ProjectConfig,
     server: ServerConfig,
     logging: LoggingConfig,
 }
@@ -31,6 +42,11 @@ impl RuntimeConfig {
         &self.database
     }
 
+    /// Returns the configured bootstrap project identity used during startup reconciliation.
+    pub fn project(&self) -> &ProjectConfig {
+        &self.project
+    }
+
     /// Returns the server bind configuration used by the runtime.
     pub fn server(&self) -> &ServerConfig {
         &self.server
@@ -42,11 +58,12 @@ impl RuntimeConfig {
     }
 
     /// Loads the runtime configuration from a caller-provided variable reader for testability.
-    fn from_reader(
+    pub(crate) fn from_reader(
         mut read_variable: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, WebBootstrapError> {
         Ok(Self {
             database: DatabaseConfig::from_reader(&mut read_variable)?,
+            project: ProjectConfig::from_reader(&mut read_variable)?,
             server: ServerConfig::from_reader(&mut read_variable)?,
             logging: read_logging_config(&mut read_variable)?,
         })
@@ -68,8 +85,8 @@ impl DatabaseConfig {
     fn from_reader(
         mut read_variable: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, WebBootstrapError> {
-        let raw_path =
-            read_variable("ORA_DB_PATH").unwrap_or_else(|| DEFAULT_DATABASE_PATH.to_string());
+        let raw_path = read_variable(DATABASE_PATH_ENV_VAR)
+            .unwrap_or_else(|| DEFAULT_DATABASE_PATH.to_string());
 
         if raw_path.trim().is_empty() {
             return Err(WebBootstrapError::InvalidDatabasePathEmpty);
@@ -77,6 +94,42 @@ impl DatabaseConfig {
 
         Ok(Self {
             path: PathBuf::from(raw_path),
+        })
+    }
+}
+
+/// Describes the bootstrap project identity that startup reconciles into persistent storage.
+pub struct ProjectConfig {
+    name: String,
+    path: PathBuf,
+}
+
+impl ProjectConfig {
+    /// Returns the configured project name used for bootstrap reconciliation.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the configured project root path used for bootstrap reconciliation.
+    pub fn path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    /// Loads the bootstrap project identity from a caller-provided variable reader for testability.
+    fn from_reader(
+        mut read_variable: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self, WebBootstrapError> {
+        Ok(Self {
+            name: read_required_non_empty_variable(
+                &mut read_variable,
+                PROJECT_NAME_ENV_VAR,
+                WebBootstrapError::InvalidProjectNameEmpty,
+            )?,
+            path: PathBuf::from(read_required_non_empty_variable(
+                &mut read_variable,
+                PROJECT_PATH_ENV_VAR,
+                WebBootstrapError::InvalidProjectPathEmpty,
+            )?),
         })
     }
 }
@@ -107,14 +160,14 @@ impl ServerConfig {
     fn from_reader(
         mut read_variable: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, WebBootstrapError> {
-        let raw_host = read_variable("ORA_HOST").unwrap_or_else(|| DEFAULT_HOST.to_string());
+        let raw_host = read_variable(HOST_ENV_VAR).unwrap_or_else(|| DEFAULT_HOST.to_string());
         let host = raw_host
             .parse::<IpAddr>()
             .map_err(|source| WebBootstrapError::InvalidHost {
                 value: raw_host.clone(),
                 source,
             })?;
-        let raw_port = read_variable("ORA_PORT").unwrap_or_else(|| DEFAULT_PORT.to_string());
+        let raw_port = read_variable(PORT_ENV_VAR).unwrap_or_else(|| DEFAULT_PORT.to_string());
         let port = raw_port
             .parse::<u16>()
             .map_err(|source| WebBootstrapError::InvalidPort {
@@ -130,7 +183,7 @@ impl ServerConfig {
 fn read_logging_config(
     mut read_variable: impl FnMut(&str) -> Option<String>,
 ) -> Result<LoggingConfig, WebBootstrapError> {
-    let level = match read_variable("ORA_LOG_LEVEL")
+    let level = match read_variable(LOG_LEVEL_ENV_VAR)
         .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string())
         .to_ascii_lowercase()
         .as_str()
@@ -146,11 +199,11 @@ fn read_logging_config(
         }
     };
     let file_config = FileLoggingConfig::new(
-        read_variable("ORA_LOG_PATH").unwrap_or_else(|| DEFAULT_LOG_PATH.to_string()),
+        read_variable(LOG_PATH_ENV_VAR).unwrap_or_else(|| DEFAULT_LOG_PATH.to_string()),
         RotationPolicy::Daily,
         read_log_max_days(&mut read_variable)?,
     );
-    let output = match read_variable("ORA_LOG_MODE")
+    let output = match read_variable(LOG_MODE_ENV_VAR)
         .unwrap_or_else(|| DEFAULT_LOG_MODE.to_string())
         .to_ascii_lowercase()
         .as_str()
@@ -173,7 +226,7 @@ fn read_log_max_days(
     mut read_variable: impl FnMut(&str) -> Option<String>,
 ) -> Result<NonZeroUsize, WebBootstrapError> {
     let raw_value =
-        read_variable("ORA_LOG_MAX_DAYS").unwrap_or_else(|| DEFAULT_LOG_MAX_DAYS.to_string());
+        read_variable(LOG_MAX_DAYS_ENV_VAR).unwrap_or_else(|| DEFAULT_LOG_MAX_DAYS.to_string());
     let parsed_value =
         raw_value
             .parse::<usize>()
@@ -185,11 +238,27 @@ fn read_log_max_days(
     NonZeroUsize::new(parsed_value).ok_or(WebBootstrapError::InvalidLogMaxDaysZero)
 }
 
+/// Reads one required environment variable and rejects blank values before bootstrap proceeds.
+fn read_required_non_empty_variable(
+    mut read_variable: impl FnMut(&str) -> Option<String>,
+    variable_name: &str,
+    empty_error: WebBootstrapError,
+) -> Result<String, WebBootstrapError> {
+    let value = read_variable(variable_name).unwrap_or_default();
+
+    if value.trim().is_empty() {
+        return Err(empty_error);
+    }
+
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_DATABASE_PATH, DEFAULT_HOST, DEFAULT_PORT, DatabaseConfig, RuntimeConfig,
-        ServerConfig,
+        DATABASE_PATH_ENV_VAR, DEFAULT_DATABASE_PATH, DEFAULT_HOST, DEFAULT_PORT, DatabaseConfig,
+        HOST_ENV_VAR, PORT_ENV_VAR, PROJECT_NAME_ENV_VAR, PROJECT_PATH_ENV_VAR, ProjectConfig,
+        RuntimeConfig, ServerConfig,
     };
     use crate::error::WebBootstrapError;
     use pretty_assertions::assert_eq;
@@ -211,7 +280,7 @@ mod tests {
     #[test]
     fn rejects_empty_database_path_configuration() {
         let error = match DatabaseConfig::from_reader(|key| match key {
-            "ORA_DB_PATH" => Some("   ".to_string()),
+            DATABASE_PATH_ENV_VAR => Some("   ".to_string()),
             _ => None,
         }) {
             Ok(_) => panic!("expected empty database path configuration to fail"),
@@ -219,6 +288,49 @@ mod tests {
         };
 
         assert!(matches!(error, WebBootstrapError::InvalidDatabasePathEmpty));
+    }
+
+    /// Verifies bootstrap project configuration requires both a non-empty name and path.
+    #[test]
+    fn rejects_missing_project_configuration() {
+        let error = match ProjectConfig::from_reader(|_| None) {
+            Ok(_) => panic!("expected missing project configuration to fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, WebBootstrapError::InvalidProjectNameEmpty));
+    }
+
+    /// Verifies blank bootstrap project paths fail with a typed bootstrap error.
+    #[test]
+    fn rejects_empty_project_path_configuration() {
+        let error = match ProjectConfig::from_reader(|key| match key {
+            PROJECT_NAME_ENV_VAR => Some("Ora".to_string()),
+            PROJECT_PATH_ENV_VAR => Some("   ".to_string()),
+            _ => None,
+        }) {
+            Ok(_) => panic!("expected empty project path configuration to fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, WebBootstrapError::InvalidProjectPathEmpty));
+    }
+
+    /// Verifies bootstrap project configuration exposes the configured identity unchanged.
+    #[test]
+    fn loads_project_configuration() {
+        let config = ProjectConfig::from_reader(|key| match key {
+            PROJECT_NAME_ENV_VAR => Some("Ora".to_string()),
+            PROJECT_PATH_ENV_VAR => Some("/tmp/ora".to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|error| panic!("expected project configuration to load: {error}"));
+
+        assert_eq!(config.name(), "Ora");
+        assert_eq!(
+            config.path().to_string_lossy().to_string(),
+            "/tmp/ora".to_string()
+        );
     }
 
     /// Verifies the server configuration defaults to the documented host and port.
@@ -236,8 +348,8 @@ mod tests {
     #[test]
     fn rejects_invalid_port_configuration() {
         let error = match ServerConfig::from_reader(|key| match key {
-            "ORA_HOST" => Some(DEFAULT_HOST.to_string()),
-            "ORA_PORT" => Some("not-a-port".to_string()),
+            HOST_ENV_VAR => Some(DEFAULT_HOST.to_string()),
+            PORT_ENV_VAR => Some("not-a-port".to_string()),
             _ => None,
         }) {
             Ok(_) => panic!("expected invalid port configuration to fail"),
@@ -253,13 +365,21 @@ mod tests {
     /// Verifies the runtime configuration loads both the server and logging contracts together.
     #[test]
     fn loads_runtime_configuration() {
-        let config = RuntimeConfig::from_reader(|_| None).unwrap_or_else(|error| {
-            panic!("expected runtime configuration to load: {error}");
-        });
+        let config = RuntimeConfig::from_reader(|key| match key {
+            PROJECT_NAME_ENV_VAR => Some("Ora".to_string()),
+            PROJECT_PATH_ENV_VAR => Some("/tmp/ora".to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|error| panic!("expected runtime configuration to load: {error}"));
 
         assert_eq!(
             config.database().path().to_string_lossy().to_string(),
             DEFAULT_DATABASE_PATH.to_string()
+        );
+        assert_eq!(config.project().name(), "Ora");
+        assert_eq!(
+            config.project().path().to_string_lossy().to_string(),
+            "/tmp/ora".to_string()
         );
         assert_eq!(
             config.server().socket_address().to_string(),

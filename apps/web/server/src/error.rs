@@ -33,10 +33,16 @@ pub enum WebBootstrapError {
     },
     #[error("ORA_DB_PATH must not be empty")]
     InvalidDatabasePathEmpty,
+    #[error("ORA_PROJECT_NAME must not be empty")]
+    InvalidProjectNameEmpty,
+    #[error("ORA_PROJECT_PATH must not be empty")]
+    InvalidProjectPathEmpty,
     #[error("ORA_LOG_MAX_DAYS must be greater than zero")]
     InvalidLogMaxDaysZero,
     #[error("failed to bootstrap SQLite database")]
     DatabaseBootstrap(#[source] ora_db::DatabaseError),
+    #[error("failed to reconcile bootstrap project: {message}")]
+    ProjectBootstrap { message: String },
     #[error(transparent)]
     LoggingInit(#[from] ora_logging::LoggingInitError),
     #[error("failed to bind HTTP listener")]

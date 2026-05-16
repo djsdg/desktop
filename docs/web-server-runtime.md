@@ -16,6 +16,19 @@ The web server reads its SQLite database path from:
 
 Startup bootstraps the database through `ora-db`, applies the active migration catalog, and constructs the shared repository pool before the runtime is marked ready.
 
+## Project Configuration
+
+The web server also requires a bootstrap project identity:
+
+- `ORA_PROJECT_NAME`: persisted workspace project name. Required.
+- `ORA_PROJECT_PATH`: persisted workspace root path. Required.
+
+Startup reconciles this configured project into the `projects` table before the runtime is marked ready.
+
+- If no visible project exists with the configured name, startup creates one row.
+- If a visible project exists with the configured name but a different stored path, startup updates that row in place.
+- If both the configured name and path already match, startup leaves the row unchanged.
+
 ## Bind Configuration
 
 The web server reads its listener configuration from:
@@ -66,5 +79,5 @@ Request and response payloads use `ora-contracts` DTO shapes, so transport behav
 The current runtime uses a file-backed SQLite database bootstrapped through `ora-db`.
 
 - Data persists across process restarts as long as the same `ORA_DB_PATH` is reused.
-- Readiness depends on successful database bootstrap and repository-pool construction.
+- Readiness depends on successful database bootstrap, repository-pool construction, and bootstrap-project reconciliation.
 - Application-layer failures still map into the shared structured HTTP error envelope across all four route families.

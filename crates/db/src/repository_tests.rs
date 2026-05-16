@@ -75,6 +75,12 @@ fn project_repository_supports_crud_and_soft_delete() {
         Some(created_project.clone())
     );
     assert_eq!(
+        repository
+            .find_project_by_name(&created_project.name)
+            .unwrap(),
+        Some(created_project.clone())
+    );
+    assert_eq!(
         repository.list_projects().unwrap(),
         vec![created_project.clone()]
     );
@@ -96,12 +102,65 @@ fn project_repository_supports_crud_and_soft_delete() {
     );
     assert_eq!(
         repository
+            .find_project_by_name(&updated_project.name)
+            .unwrap(),
+        Some(updated_project.clone())
+    );
+    assert_eq!(
+        repository
             .soft_delete_project(&updated_project.id, /*deleted_at*/ 30)
             .unwrap(),
         true
     );
     assert_eq!(repository.find_project(&updated_project.id).unwrap(), None);
+    assert_eq!(
+        repository
+            .find_project_by_name(&updated_project.name)
+            .unwrap(),
+        None
+    );
     assert_eq!(repository.list_projects().unwrap(), Vec::<Project>::new());
+}
+
+/// Verifies the SQLite-backed project repository can load one visible project by exact name.
+#[test]
+fn project_repository_finds_visible_project_by_name() {
+    let (_temp_dir, pool) = bootstrapped_repository_pool();
+    let repository = SqliteProjectRepository::new(pool);
+    let project = Project::new(
+        ProjectId::new("project-1"),
+        "Ora",
+        "/tmp/ora",
+        AuditFields::new(14, 14, false),
+    );
+
+    repository.create_project(project.clone()).unwrap();
+
+    assert_eq!(
+        repository.find_project_by_name("Ora").unwrap(),
+        Some(project)
+    );
+    assert_eq!(repository.find_project_by_name("Missing").unwrap(), None);
+}
+
+/// Verifies the SQLite-backed project repository hides soft-deleted rows during name-based lookup.
+#[test]
+fn project_repository_ignores_soft_deleted_projects_during_name_lookup() {
+    let (_temp_dir, pool) = bootstrapped_repository_pool();
+    let repository = SqliteProjectRepository::new(pool);
+    let project = Project::new(
+        ProjectId::new("project-1"),
+        "Ora",
+        "/tmp/ora",
+        AuditFields::new(15, 15, false),
+    );
+
+    repository.create_project(project.clone()).unwrap();
+    repository
+        .soft_delete_project(&project.id, /*deleted_at*/ 16)
+        .unwrap();
+
+    assert_eq!(repository.find_project_by_name("Ora").unwrap(), None);
 }
 
 /// Verifies the SQLite-backed task repository preserves CRUD snapshots and hides soft-deleted rows.

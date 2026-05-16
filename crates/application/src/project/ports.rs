@@ -14,6 +14,12 @@ pub trait ProjectRepository {
         project_id: &ProjectId,
     ) -> Result<Option<Project>, ProjectRepositoryError>;
 
+    /// Loads one visible project by its exact persisted name.
+    fn find_project_by_name(
+        &self,
+        project_name: &str,
+    ) -> Result<Option<Project>, ProjectRepositoryError>;
+
     /// Lists every visible project in storage order.
     fn list_projects(&self) -> Result<Vec<Project>, ProjectRepositoryError>;
 
