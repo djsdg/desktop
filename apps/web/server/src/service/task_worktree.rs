@@ -1,3 +1,4 @@
+use gitlancer::git::branch::ListBranchesRequest;
 use gitlancer::git::worktree::{
     CreateWorktreeRequest as GitCreateWorktreeRequest,
     DeleteWorktreeRequest as GitDeleteWorktreeRequest, FindWorktreeRequest,
@@ -29,6 +30,25 @@ impl GitTaskWorktreeProvisioner {
 }
 
 impl TaskWorktreeProvisioner for GitTaskWorktreeProvisioner {
+    /// Checks local refs so orphaned task branches also participate in id collision avoidance.
+    fn task_branch_exists(&self, branch_name: &str) -> Result<bool, TaskWorktreeProvisionerError> {
+        self.git
+            .list_branches(ListBranchesRequest {
+                repository: &self.repository,
+            })
+            .map(|response| {
+                response
+                    .branches
+                    .iter()
+                    .any(|branch| branch.as_str() == branch_name)
+            })
+            .map_err(|_| {
+                TaskWorktreeProvisionerError::OperationFailed(
+                    "failed to inspect task branches".to_string(),
+                )
+            })
+    }
+
     /// Creates one linked worktree and hides Git-specific diagnostics behind a stable application port.
     fn create_task_worktree(
         &self,

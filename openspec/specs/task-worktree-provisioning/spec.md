@@ -15,6 +15,14 @@ The system SHALL treat linked worktree provisioning as part of task creation. Wh
 - **WHEN** the backend generates a new task identifier during task creation
 - **THEN** it derives the Git branch name from a short task-id prefix and the worktree directory from the full task identifier under the configured worktree root
 
+#### Scenario: Short branch-prefix collisions regenerate the task identity
+- **WHEN** the generated short task-id prefix is already used by a task worktree directory or a local `ora/<prefix>` branch
+- **THEN** the backend generates another task identifier before provisioning, because the collision applies to the shortened branch name rather than the full-identifier worktree directory
+
+#### Scenario: Orphaned task branches still reserve their prefix
+- **WHEN** a task worktree directory has been removed but its local `ora/<prefix>` branch remains
+- **THEN** the backend treats that prefix as unavailable and generates another task identifier
+
 ### Requirement: Task creation SHALL keep Git and persistence state aligned
 The system SHALL avoid exposing partially created task workspaces. If linked-worktree provisioning fails, the backend SHALL return a failure without persisting task or worktree rows. If persistence fails after the Git worktree is created, the backend SHALL attempt compensating cleanup of that linked worktree before returning a failure.
 

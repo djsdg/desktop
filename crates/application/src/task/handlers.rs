@@ -15,7 +15,12 @@ use ora_domain::{
     Worktree as DomainWorktree, WorktreeActivity as DomainWorktreeActivity, WorktreeId,
 };
 use ora_logging::{ora_error, ora_info};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+
+const TASK_BRANCH_PREFIX_LEN: usize = 8;
+const MAX_TASK_ID_GENERATION_ATTEMPTS: usize = 3;
 
 /// Handles task creation without depending on transport-specific concerns.
 pub struct CreateTaskHandler<
@@ -102,7 +107,9 @@ where
         &self,
         request: CreateTaskRequest,
     ) -> Result<CreateTaskResponse, ApplicationError> {
-        let task_id = self.task_id_generator.generate_task_id();
+        let task_id = self
+            .select_available_task_id()
+            .inspect_err(|error| log_task_failure("create_task", None, error))?;
         let branch_name = branch_name_for_task(&task_id);
         let worktree_path = worktree_path_for_task(&self.work_dir, &task_id);
         self.worktree_provisioner
@@ -160,6 +167,33 @@ where
 
         Ok(CreateTaskResponse {
             task: map_task(task),
+        })
+    }
+
+    /// Generates a task id whose branch prefix does not collide with existing task worktree folders.
+    fn select_available_task_id(&self) -> Result<TaskId, ApplicationError> {
+        for _ in 0..MAX_TASK_ID_GENERATION_ATTEMPTS {
+            let task_id = self.task_id_generator.generate_task_id();
+            let branch_prefix = task_branch_prefix(&task_id);
+
+            if task_branch_prefix_exists_in_work_dir(&self.work_dir, &branch_prefix)? {
+                continue;
+            }
+
+            let branch_name = branch_name_for_task(&task_id);
+            let branch_exists = self
+                .worktree_provisioner
+                .task_branch_exists(&branch_name)
+                .map_err(ApplicationError::from_task_worktree_provisioner_error)?;
+            if !branch_exists {
+                return Ok(task_id);
+            }
+        }
+
+        Err(ApplicationError::TaskWorktree {
+            message: format!(
+                "failed to generate a task branch prefix without collision after {MAX_TASK_ID_GENERATION_ATTEMPTS} attempts"
+            ),
         })
     }
 
@@ -598,13 +632,123 @@ fn map_contract_task_status(status: TaskStatus) -> DomainTaskStatus {
 
 /// Derives the stable task branch name from the first eight characters of the generated task id.
 fn branch_name_for_task(task_id: &TaskId) -> String {
-    format!(
-        "ora/{}",
-        task_id.to_string().chars().take(8).collect::<String>()
-    )
+    format!("ora/{}", task_branch_prefix(task_id))
+}
+
+/// Derives the short branch prefix used to keep task branch names readable.
+fn task_branch_prefix(task_id: &TaskId) -> String {
+    task_id
+        .to_string()
+        .chars()
+        .take(TASK_BRANCH_PREFIX_LEN)
+        .collect()
 }
 
 /// Derives the owned linked-worktree path from the configured worktree root and full task id.
 fn worktree_path_for_task(work_dir: &Path, task_id: &TaskId) -> PathBuf {
     work_dir.join(task_id.to_string())
+}
+
+/// Checks existing task worktree folders before branch creation because branch names use short ids.
+fn task_branch_prefix_exists_in_work_dir(
+    work_dir: &Path,
+    branch_prefix: &str,
+) -> Result<bool, ApplicationError> {
+    let entries = match fs::read_dir(work_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => {
+            return Err(ApplicationError::TaskWorktree {
+                message: "failed to inspect task worktree directory".to_string(),
+            });
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|_| ApplicationError::TaskWorktree {
+            message: "failed to inspect task worktree directory".to_string(),
+        })?;
+        let file_type = entry
+            .file_type()
+            .map_err(|_| ApplicationError::TaskWorktree {
+                message: "failed to inspect task worktree directory".to_string(),
+            })?;
+
+        if file_type.is_dir()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(branch_prefix)
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+#[cfg(test)]
+mod task_branch_prefix_tests {
+    use super::task_branch_prefix_exists_in_work_dir;
+    use pretty_assertions::assert_eq;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Verifies an absent worktree root is treated as the first task creation, not an inspection failure.
+    #[test]
+    fn reports_no_collision_when_work_dir_does_not_exist() {
+        let work_dir = unique_test_work_dir("missing");
+
+        assert_eq!(
+            task_branch_prefix_exists_in_work_dir(&work_dir, "12345678"),
+            Ok(false)
+        );
+    }
+
+    /// Verifies only directories with the requested prefix reserve a task branch prefix.
+    #[test]
+    fn detects_matching_directory_prefixes() {
+        let work_dir = unique_test_work_dir("matching-directory");
+        fs::create_dir_all(work_dir.join("12345678-existing"))
+            .unwrap_or_else(|error| panic!("failed to create collision fixture: {error}"));
+
+        assert_eq!(
+            task_branch_prefix_exists_in_work_dir(&work_dir, "12345678"),
+            Ok(true)
+        );
+
+        fs::remove_dir_all(&work_dir)
+            .unwrap_or_else(|error| panic!("failed to remove collision fixture: {error}"));
+    }
+
+    /// Verifies ordinary files and unrelated directories do not reserve a task branch prefix.
+    #[test]
+    fn ignores_files_and_unrelated_directories() {
+        let work_dir = unique_test_work_dir("unrelated-entries");
+        fs::create_dir_all(work_dir.join("87654321-existing"))
+            .unwrap_or_else(|error| panic!("failed to create unrelated directory: {error}"));
+        fs::write(work_dir.join("12345678-file"), b"not a worktree")
+            .unwrap_or_else(|error| panic!("failed to create ordinary file: {error}"));
+
+        assert_eq!(
+            task_branch_prefix_exists_in_work_dir(&work_dir, "12345678"),
+            Ok(false)
+        );
+
+        fs::remove_dir_all(&work_dir)
+            .unwrap_or_else(|error| panic!("failed to remove unrelated entries: {error}"));
+    }
+
+    /// Builds an isolated filesystem location for branch-prefix unit tests.
+    fn unique_test_work_dir(name: &str) -> PathBuf {
+        let work_dir = std::env::temp_dir().join(format!(
+            "ora-application-prefix-unit-{name}-{}",
+            std::process::id()
+        ));
+        if work_dir.exists() {
+            fs::remove_dir_all(&work_dir)
+                .unwrap_or_else(|error| panic!("failed to reset unit-test work dir: {error}"));
+        }
+        work_dir
+    }
 }

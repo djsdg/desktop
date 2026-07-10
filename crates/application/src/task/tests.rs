@@ -18,6 +18,7 @@ use ora_logging::{with_recorded_trace_logging, with_trace_logging};
 use pretty_assertions::assert_eq;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -92,6 +93,222 @@ fn creates_tasks_with_owned_worktrees_and_clock_values() {
             )]
         );
     });
+}
+
+/// Verifies task creation regenerates ids when the short branch prefix already exists as a worktree folder.
+#[test]
+fn regenerates_task_ids_when_branch_prefix_folder_exists() {
+    with_trace_logging(|| {
+        let work_dir = unique_test_work_dir("task-prefix-collision");
+        fs::create_dir_all(work_dir.join("12345678-existing-worktree"))
+            .unwrap_or_else(|error| panic!("failed to create prefix collision fixture: {error}"));
+        let task_repository = Rc::new(FakeTaskRepository::default());
+        let worktree_repository = Rc::new(FakeWorktreeRepository::default());
+        let provisioner = Rc::new(FakeTaskWorktreeProvisioner::default());
+        let handler = CreateTaskHandler::new(
+            task_repository.clone(),
+            worktree_repository,
+            SequenceTaskIdGenerator::new(vec![
+                "12345678-1234-5678-90ab-1234567890ab",
+                "87654321-1234-5678-90ab-1234567890ab",
+            ]),
+            FixedWorktreeIdGenerator::new("worktree-1"),
+            provisioner.clone(),
+            work_dir.clone(),
+            FixedClock::new(1_700_000_000_000),
+        );
+
+        let response = handler
+            .handle(CreateTaskRequest {
+                project_id: "project-1".to_string(),
+                title: "Ship handlers".to_string(),
+                status: ContractTaskStatus::Doing,
+            })
+            .unwrap_or_else(|error| panic!("create handler failed: {error}"));
+
+        assert_eq!(
+            response,
+            CreateTaskResponse {
+                task: ContractTask {
+                    id: "87654321-1234-5678-90ab-1234567890ab".to_string(),
+                    project_id: "project-1".to_string(),
+                    title: "Ship handlers".to_string(),
+                    status: ContractTaskStatus::Doing,
+                },
+            }
+        );
+        assert_eq!(
+            provisioner.created_requests(),
+            vec![CreateTaskWorktreeRequest {
+                branch_name: "ora/87654321".to_string(),
+                worktree_path: work_dir.join("87654321-1234-5678-90ab-1234567890ab"),
+            }]
+        );
+        assert_eq!(
+            task_repository
+                .visible_tasks()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            vec![TaskId::new("87654321-1234-5678-90ab-1234567890ab")]
+        );
+
+        fs::remove_dir_all(&work_dir)
+            .unwrap_or_else(|error| panic!("failed to remove prefix collision fixture: {error}"));
+    });
+}
+
+/// Verifies an orphaned task branch reserves its short prefix even after the worktree folder is deleted.
+#[test]
+fn regenerates_task_ids_when_orphaned_branch_exists() {
+    with_trace_logging(|| {
+        let work_dir = unique_test_work_dir("orphaned-task-branch");
+        let provisioner = Rc::new(FakeTaskWorktreeProvisioner::with_existing_branches(vec![
+            "ora/12345678",
+        ]));
+        let handler = CreateTaskHandler::new(
+            Rc::new(FakeTaskRepository::default()),
+            Rc::new(FakeWorktreeRepository::default()),
+            SequenceTaskIdGenerator::new(vec![
+                "12345678-1234-5678-90ab-1234567890ab",
+                "87654321-1234-5678-90ab-1234567890ab",
+            ]),
+            FixedWorktreeIdGenerator::new("worktree-1"),
+            provisioner.clone(),
+            work_dir.clone(),
+            FixedClock::new(1_700_000_000_000),
+        );
+
+        let response = handler
+            .handle(CreateTaskRequest {
+                project_id: "project-1".to_string(),
+                title: "Ship handlers".to_string(),
+                status: ContractTaskStatus::Doing,
+            })
+            .unwrap_or_else(|error| panic!("create handler failed: {error}"));
+
+        assert_eq!(
+            response,
+            CreateTaskResponse {
+                task: ContractTask {
+                    id: "87654321-1234-5678-90ab-1234567890ab".to_string(),
+                    project_id: "project-1".to_string(),
+                    title: "Ship handlers".to_string(),
+                    status: ContractTaskStatus::Doing,
+                },
+            }
+        );
+        assert_eq!(
+            provisioner.created_requests(),
+            vec![CreateTaskWorktreeRequest {
+                branch_name: "ora/87654321".to_string(),
+                worktree_path: work_dir.join("87654321-1234-5678-90ab-1234567890ab"),
+            }]
+        );
+    });
+}
+
+/// Verifies first-time task creation succeeds before the configured worktree root exists.
+#[test]
+fn creates_task_when_work_dir_does_not_exist() {
+    with_trace_logging(|| {
+        let work_dir = unique_test_work_dir("missing-work-dir");
+        let provisioner = Rc::new(FakeTaskWorktreeProvisioner::default());
+        let handler = CreateTaskHandler::new(
+            Rc::new(FakeTaskRepository::default()),
+            Rc::new(FakeWorktreeRepository::default()),
+            FixedTaskIdGenerator::new(TASK_ID),
+            FixedWorktreeIdGenerator::new("worktree-1"),
+            provisioner.clone(),
+            work_dir.clone(),
+            FixedClock::new(1_700_000_000_000),
+        );
+
+        let response = handler
+            .handle(CreateTaskRequest {
+                project_id: "project-1".to_string(),
+                title: "Ship handlers".to_string(),
+                status: ContractTaskStatus::Doing,
+            })
+            .unwrap_or_else(|error| panic!("create handler failed: {error}"));
+
+        assert_eq!(
+            response,
+            CreateTaskResponse {
+                task: ContractTask {
+                    id: TASK_ID.to_string(),
+                    project_id: "project-1".to_string(),
+                    title: "Ship handlers".to_string(),
+                    status: ContractTaskStatus::Doing,
+                },
+            }
+        );
+        assert_eq!(
+            provisioner.created_requests(),
+            vec![CreateTaskWorktreeRequest {
+                branch_name: "ora/12345678".to_string(),
+                worktree_path: work_dir.join(TASK_ID),
+            }]
+        );
+    });
+}
+
+/// Verifies repeated branch-prefix collisions return a stable error and emit the shared failure event.
+#[test]
+fn reports_task_worktree_error_when_task_id_retries_are_exhausted() {
+    let work_dir = unique_test_work_dir("task-prefix-exhaustion");
+    fs::create_dir_all(work_dir.join("12345678-existing-worktree"))
+        .unwrap_or_else(|error| panic!("failed to create prefix collision fixture: {error}"));
+    let recorder = EventRecorder::default();
+
+    with_recorded_trace_logging(recorder.layer(), || {
+        let handler = CreateTaskHandler::new(
+            Rc::new(FakeTaskRepository::default()),
+            Rc::new(FakeWorktreeRepository::default()),
+            FixedTaskIdGenerator::new(TASK_ID),
+            FixedWorktreeIdGenerator::new("worktree-1"),
+            Rc::new(FakeTaskWorktreeProvisioner::default()),
+            work_dir.clone(),
+            FixedClock::new(1_700_000_000_000),
+        );
+
+        assert_eq!(
+            handler
+                .handle(CreateTaskRequest {
+                    project_id: "project-1".to_string(),
+                    title: "Ship handlers".to_string(),
+                    status: ContractTaskStatus::Doing,
+                })
+                .unwrap_err(),
+            ApplicationError::TaskWorktree {
+                message:
+                    "failed to generate a task branch prefix without collision after 3 attempts"
+                        .to_string(),
+            }
+        );
+    });
+
+    assert_eq!(
+        recorder.events(),
+        vec![LoggedEvent {
+            level: "ERROR".to_string(),
+            target: "ora_application::task::handlers".to_string(),
+            fields: BTreeMap::from([
+                ("error.kind".to_string(), "task_worktree".to_string()),
+                (
+                    "error.message".to_string(),
+                    "task worktree operation failed: failed to generate a task branch prefix without collision after 3 attempts"
+                        .to_string(),
+                ),
+                ("message".to_string(), "task operation failed".to_string()),
+                ("method".to_string(), "log_task_failure".to_string()),
+                ("operation".to_string(), "create_task".to_string()),
+            ]),
+        }]
+    );
+
+    fs::remove_dir_all(&work_dir)
+        .unwrap_or_else(|error| panic!("failed to remove prefix collision fixture: {error}"));
 }
 
 /// Verifies get handlers return the shared contract projection for existing tasks.
@@ -669,6 +886,7 @@ impl WorktreeRepository for Rc<FakeWorktreeRepository> {
 
 #[derive(Debug, Default)]
 struct FakeTaskWorktreeProvisioner {
+    existing_branches: RefCell<Vec<String>>,
     created_requests: RefCell<Vec<CreateTaskWorktreeRequest>>,
     deleted_requests: RefCell<Vec<DeleteTaskWorktreeRequest>>,
     next_create_error: RefCell<Option<TaskWorktreeProvisionerError>>,
@@ -676,6 +894,14 @@ struct FakeTaskWorktreeProvisioner {
 }
 
 impl FakeTaskWorktreeProvisioner {
+    /// Builds a fake provisioner seeded with repository-local branches.
+    fn with_existing_branches(branches: Vec<&str>) -> Self {
+        Self {
+            existing_branches: RefCell::new(branches.into_iter().map(str::to_string).collect()),
+            ..Self::default()
+        }
+    }
+
     /// Configures the next create request to fail with a deterministic error.
     fn fail_next_create(&self, error: TaskWorktreeProvisionerError) {
         self.next_create_error.replace(Some(error));
@@ -709,6 +935,14 @@ impl FakeTaskWorktreeProvisioner {
 }
 
 impl TaskWorktreeProvisioner for Rc<FakeTaskWorktreeProvisioner> {
+    fn task_branch_exists(&self, branch_name: &str) -> Result<bool, TaskWorktreeProvisionerError> {
+        Ok(self
+            .existing_branches
+            .borrow()
+            .iter()
+            .any(|branch| branch == branch_name))
+    }
+
     fn create_task_worktree(
         &self,
         request: CreateTaskWorktreeRequest,
@@ -747,6 +981,28 @@ impl TaskIdGenerator for FixedTaskIdGenerator {
     }
 }
 
+struct SequenceTaskIdGenerator {
+    task_ids: RefCell<Vec<TaskId>>,
+}
+
+impl SequenceTaskIdGenerator {
+    /// Builds an identifier generator that returns ids in the provided order.
+    fn new(task_ids: Vec<&str>) -> Self {
+        Self {
+            task_ids: RefCell::new(task_ids.into_iter().rev().map(TaskId::new).collect()),
+        }
+    }
+}
+
+impl TaskIdGenerator for SequenceTaskIdGenerator {
+    fn generate_task_id(&self) -> TaskId {
+        self.task_ids
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| panic!("sequence task id generator exhausted"))
+    }
+}
+
 struct FixedWorktreeIdGenerator {
     worktree_id: WorktreeId,
 }
@@ -781,6 +1037,18 @@ impl Clock for FixedClock {
     fn now_timestamp_millis(&self) -> i64 {
         self.timestamp_millis
     }
+}
+
+/// Builds a process-scoped temp path for tests that need filesystem-backed worktree roots.
+fn unique_test_work_dir(name: &str) -> PathBuf {
+    let work_dir =
+        std::env::temp_dir().join(format!("ora-application-{name}-{}", std::process::id()));
+    if work_dir.exists() {
+        fs::remove_dir_all(&work_dir)
+            .unwrap_or_else(|error| panic!("failed to reset test work dir: {error}"));
+    }
+
+    work_dir
 }
 
 /// Captures one emitted event in a comparison-friendly structure for logging assertions.

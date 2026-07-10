@@ -37,6 +37,9 @@ pub trait TaskIdGenerator {
 /// Implementations are expected to provision and remove backend-managed task worktrees
 /// while hiding Git and filesystem details from the application layer.
 pub trait TaskWorktreeProvisioner {
+    /// Reports whether the repository already contains the task branch, including orphaned branches without worktree folders.
+    fn task_branch_exists(&self, branch_name: &str) -> Result<bool, TaskWorktreeProvisionerError>;
+
     /// Creates the linked worktree requested by the task-create flow.
     fn create_task_worktree(
         &self,
