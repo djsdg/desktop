@@ -2,6 +2,7 @@ mod handlers;
 mod id_generator;
 mod mapper;
 mod ports;
+mod worktree_provisioner;
 
 #[cfg(test)]
 mod tests;
@@ -15,3 +16,4 @@ pub use ports::{
     TaskRepositoryError, TaskWorktreeDeletionMode, TaskWorktreeProvisioner,
     TaskWorktreeProvisionerError,
 };
+pub use worktree_provisioner::GitTaskWorktreeProvisioner;

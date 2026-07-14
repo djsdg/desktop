@@ -1,8 +1,8 @@
 use crate::bootstrap::SystemClock;
-use crate::service::task_worktree::GitTaskWorktreeProvisioner;
 use ora_application::{
-    ApplicationError, CreateTaskHandler, DeleteTaskHandler, GetTaskHandler, ListTasksHandler,
-    UpdateTaskHandler, UuidTaskIdGenerator, UuidWorktreeIdGenerator,
+    ApplicationError, CreateTaskHandler, DeleteTaskHandler, GetTaskHandler,
+    GitTaskWorktreeProvisioner, ListTasksHandler, UpdateTaskHandler, UuidTaskIdGenerator,
+    UuidWorktreeIdGenerator,
 };
 use ora_contracts::{
     CreateTaskRequest, CreateTaskResponse, DeleteTaskRequest, DeleteTaskResponse, GetTaskRequest,

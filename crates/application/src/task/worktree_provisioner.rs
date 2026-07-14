@@ -1,3 +1,7 @@
+use super::{
+    CreateTaskWorktreeRequest, DeleteTaskWorktreeRequest, TaskWorktreeDeletionMode,
+    TaskWorktreeProvisioner, TaskWorktreeProvisionerError,
+};
 use gitlancer::git::branch::ListBranchesRequest;
 use gitlancer::git::worktree::{
     CreateWorktreeRequest as GitCreateWorktreeRequest,
@@ -5,14 +9,10 @@ use gitlancer::git::worktree::{
     WorktreeDeletionMode as GitWorktreeDeletionMode,
 };
 use gitlancer::{BranchName, CliGitRunner, Git, RepoRoot, Repository, WorktreeRoot};
-use ora_application::{
-    CreateTaskWorktreeRequest, DeleteTaskWorktreeRequest, TaskWorktreeDeletionMode,
-    TaskWorktreeProvisioner, TaskWorktreeProvisionerError,
-};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Provisions and removes backend-owned task worktrees through the shared Git runtime.
+/// Provisions and removes application-owned task worktrees through the shared Git runtime.
 #[derive(Clone, Debug)]
 pub struct GitTaskWorktreeProvisioner {
     git: Git<CliGitRunner>,
@@ -49,7 +49,7 @@ impl TaskWorktreeProvisioner for GitTaskWorktreeProvisioner {
             })
     }
 
-    /// Creates one linked worktree and hides Git-specific diagnostics behind a stable application port.
+    /// Creates one linked worktree while keeping Git-specific diagnostics inside the application.
     fn create_task_worktree(
         &self,
         request: CreateTaskWorktreeRequest,
@@ -69,7 +69,7 @@ impl TaskWorktreeProvisioner for GitTaskWorktreeProvisioner {
             })
     }
 
-    /// Deletes one linked worktree and hides Git-specific diagnostics behind a stable application port.
+    /// Deletes one linked worktree while keeping Git-specific diagnostics inside the application.
     fn delete_task_worktree(
         &self,
         request: DeleteTaskWorktreeRequest,
@@ -104,7 +104,7 @@ impl TaskWorktreeProvisioner for GitTaskWorktreeProvisioner {
     }
 }
 
-/// Ensures the parent directory for a task-owned worktree exists before Git tries to populate it.
+/// Creates the parent eagerly because Git expects the worktree path's ancestor to exist.
 fn create_parent_directory(worktree_path: &Path) -> Result<(), TaskWorktreeProvisionerError> {
     match worktree_path.parent() {
         Some(parent_directory) => fs::create_dir_all(parent_directory).map_err(|_| {
