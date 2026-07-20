@@ -74,6 +74,9 @@ fn runtime_builds_complete_task_diff() {
         .write_file(scaffold.repo_path(), "untracked.txt", "untracked change\n")
         .expect("write untracked change");
     scaffold
+        .write_file(scaffold.repo_path(), "empty.txt", "")
+        .expect("write empty untracked file");
+    scaffold
         .run_git(["config", "filter.guard.clean", "false"])
         .expect("configure failing clean filter");
     scaffold
@@ -113,6 +116,7 @@ fn runtime_builds_complete_task_diff() {
     assert_ne!(response.head_commit_id, base_commit_id);
     for expected_path in [
         "README.md",
+        "empty.txt",
         "staged.txt",
         "untracked.txt",
         "untracked.guard",
@@ -127,6 +131,13 @@ fn runtime_builds_complete_task_diff() {
     }
     assert!(response.patch.contains("+unstaged change"));
     assert!(response.patch.contains("+untracked change"));
+    let empty_file_patch = response
+        .patch
+        .split("diff --git ")
+        .find(|section| section.starts_with("a/empty.txt b/empty.txt\n"))
+        .expect("empty file should have its own patch section");
+    assert!(empty_file_patch.contains("new file mode 100644"));
+    assert!(empty_file_patch.contains("index 0000000..e69de29"));
     assert!(
         response
             .patch

@@ -94,6 +94,8 @@ GET /api/tasks/{taskId}/diff
 const files = parseDiff(response.patch);
 ```
 
+契约包使用 `react-diff-view` 自带的 `parseDiff` 对后端标准 patch 进行集成测试，覆盖文本、空文件和二进制文件，避免后端格式与实际前端解析器发生漂移。
+
 这样后端 contract 不依赖某个前端组件的内部类型；将来替换组件时也不需要修改 Git 领域接口。
 
 生成的 SDK 调用为：

@@ -7,7 +7,7 @@ use crate::exec::runner::GitRunner;
 use crate::git::Git;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-static ISOLATED_GIT_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static TEMPORARY_GIT_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const MAX_DIFF_BYTES: usize = 10 * 1024 * 1024;
 const MAX_DIFF_STDERR_BYTES: usize = 1024 * 1024;
@@ -70,6 +70,11 @@ impl<R: GitRunner> Git<R> {
                 &build_untracked_diff_command(request.worktree, path, &isolated_git_dir),
                 remaining,
             )?;
+            let untracked_patch = if untracked_patch.is_empty() {
+                run_empty_untracked_diff(self.runner(), request.worktree, path, remaining)?
+            } else {
+                untracked_patch
+            };
             append_patch(&mut patch, &untracked_patch);
         }
 
@@ -82,11 +87,43 @@ impl<R: GitRunner> Git<R> {
 
 /// Generates a process-unique nonexistent Git directory so no-index ignores repository filters.
 fn isolated_git_dir() -> std::path::PathBuf {
-    let sequence = ISOLATED_GIT_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = TEMPORARY_GIT_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
         "ora-no-index-git-dir-{}-{sequence}",
         std::process::id()
     ))
+}
+
+/// Owns a temporary Git index path and removes any index or lock file left by Git commands.
+struct TemporaryIndex {
+    path: std::path::PathBuf,
+}
+
+impl TemporaryIndex {
+    /// Reserves a process-unique path without creating an invalid empty index file.
+    fn new() -> Self {
+        let sequence = TEMPORARY_GIT_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        Self {
+            path: std::env::temp_dir().join(format!(
+                "ora-empty-untracked-index-{}-{sequence}",
+                std::process::id()
+            )),
+        }
+    }
+
+    /// Returns the path passed to Git through `GIT_INDEX_FILE`.
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TemporaryIndex {
+    /// Best-effort cleanup keeps diff failures from accumulating temporary index files.
+    fn drop(&mut self) {
+        let _remove_index_result = std::fs::remove_file(&self.path);
+        let lock_path = self.path.with_extension("lock");
+        let _remove_lock_result = std::fs::remove_file(lock_path);
+    }
 }
 
 /// Accepts exit code one because `git diff --no-index` uses it to report that files differ.
@@ -104,6 +141,33 @@ fn run_untracked_diff<R: GitRunner>(
         }) => Ok(stdout),
         Err(error) => Err(map_bounded_diff_error(error)),
     }
+}
+
+/// Uses an isolated intent-to-add index so Git emits metadata for an empty untracked file.
+fn run_empty_untracked_diff<R: GitRunner>(
+    runner: &R,
+    worktree: &WorktreeHandle,
+    path: &str,
+    max_stdout_bytes: usize,
+) -> Result<String, GitlancerError> {
+    let temporary_index = TemporaryIndex::new();
+    runner.run(&build_initialize_temporary_index_command(
+        worktree,
+        temporary_index.path(),
+    ))?;
+    runner.run(&build_intent_to_add_command(
+        worktree,
+        path,
+        temporary_index.path(),
+    ))?;
+    runner
+        .run_bounded(
+            &build_empty_untracked_diff_command(worktree, path, temporary_index.path()),
+            max_stdout_bytes,
+            MAX_DIFF_STDERR_BYTES,
+        )
+        .map(|output| output.stdout)
+        .map_err(map_bounded_diff_error)
 }
 
 /// Converts bounded runner failures into the public diff-size error when appropriate.
@@ -192,6 +256,73 @@ fn build_untracked_diff_command(
     )
 }
 
+/// Initializes a temporary index from HEAD without reading or changing the real worktree index.
+fn build_initialize_temporary_index_command(
+    worktree: &WorktreeHandle,
+    temporary_index: &std::path::Path,
+) -> GitCommand {
+    command_with_index(
+        worktree,
+        vec!["read-tree", "HEAD"],
+        temporary_index,
+        GitIntent::Mutating,
+    )
+}
+
+/// Records only intent-to-add metadata so Git can distinguish an empty file from `/dev/null`.
+fn build_intent_to_add_command(
+    worktree: &WorktreeHandle,
+    path: &str,
+    temporary_index: &std::path::Path,
+) -> GitCommand {
+    command_with_index(
+        worktree,
+        vec!["add", "--intent-to-add", "--", path],
+        temporary_index,
+        GitIntent::Mutating,
+    )
+}
+
+/// Renders an empty intent-to-add entry as a canonical new-file patch.
+fn build_empty_untracked_diff_command(
+    worktree: &WorktreeHandle,
+    path: &str,
+    temporary_index: &std::path::Path,
+) -> GitCommand {
+    command_with_index(
+        worktree,
+        vec![
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--unified=3",
+            "--",
+            path,
+        ],
+        temporary_index,
+        GitIntent::ReadOnly,
+    )
+}
+
+/// Creates a Git command whose mutations are isolated to a disposable index file.
+fn command_with_index(
+    worktree: &WorktreeHandle,
+    args: Vec<&str>,
+    temporary_index: &std::path::Path,
+    intent: GitIntent,
+) -> GitCommand {
+    GitCommand::new(
+        worktree.worktree_root().as_path().to_path_buf(),
+        args.into_iter().map(str::to_string).collect(),
+        GitEnv::default().with_variable(
+            "GIT_INDEX_FILE",
+            temporary_index.to_string_lossy().into_owned(),
+        ),
+        intent,
+    )
+}
+
 /// Creates a read-only Git command from borrowed arguments.
 fn command(worktree: &WorktreeHandle, args: Vec<&str>) -> GitCommand {
     GitCommand::new(
@@ -204,7 +335,11 @@ fn command(worktree: &WorktreeHandle, args: Vec<&str>) -> GitCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffRequest, build_diff_command, build_untracked_diff_command};
+    use super::{
+        DiffRequest, build_diff_command, build_empty_untracked_diff_command,
+        build_initialize_temporary_index_command, build_intent_to_add_command,
+        build_untracked_diff_command,
+    };
     use crate::{CommitId, GitDir, RepoRoot, WorktreeHandle, WorktreeKind, WorktreeRoot};
     use pretty_assertions::assert_eq;
 
@@ -255,6 +390,62 @@ mod tests {
                 "--",
                 "/dev/null",
                 "space name.bin",
+            ]
+        );
+    }
+
+    /// Verifies empty-file fallback commands share one isolated index and never touch the real one.
+    #[test]
+    fn builds_empty_untracked_file_commands() {
+        let worktree = test_worktree();
+        let temporary_index = std::path::Path::new("/tmp/empty-file-index");
+
+        let commands = [
+            build_initialize_temporary_index_command(&worktree, temporary_index),
+            build_intent_to_add_command(&worktree, "empty.txt", temporary_index),
+            build_empty_untracked_diff_command(&worktree, "empty.txt", temporary_index),
+        ];
+
+        assert_eq!(
+            commands.map(|command| (command.args, command.env.variables)),
+            [
+                (
+                    vec!["read-tree".to_string(), "HEAD".to_string()],
+                    [(
+                        "GIT_INDEX_FILE".to_string(),
+                        "/tmp/empty-file-index".to_string(),
+                    ),]
+                    .into(),
+                ),
+                (
+                    vec![
+                        "add".to_string(),
+                        "--intent-to-add".to_string(),
+                        "--".to_string(),
+                        "empty.txt".to_string(),
+                    ],
+                    [(
+                        "GIT_INDEX_FILE".to_string(),
+                        "/tmp/empty-file-index".to_string(),
+                    ),]
+                    .into(),
+                ),
+                (
+                    vec![
+                        "diff".to_string(),
+                        "--no-color".to_string(),
+                        "--no-ext-diff".to_string(),
+                        "--no-textconv".to_string(),
+                        "--unified=3".to_string(),
+                        "--".to_string(),
+                        "empty.txt".to_string(),
+                    ],
+                    [(
+                        "GIT_INDEX_FILE".to_string(),
+                        "/tmp/empty-file-index".to_string(),
+                    ),]
+                    .into(),
+                ),
             ]
         );
     }
