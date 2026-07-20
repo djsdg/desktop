@@ -5,6 +5,7 @@ mod project_work_context;
 mod session;
 mod skill;
 mod task;
+mod task_diff;
 
 pub use agent::{
     Agent, CreateAgentRequest, CreateAgentResponse, DeleteAgentRequest, DeleteAgentResponse,
@@ -14,7 +15,9 @@ pub use agent::{
 pub use frontend::{
     AGENT_PATH, AGENTS_PATH, FrontendEndpoint, FrontendHttpMethod, FrontendPathParam, PROJECT_PATH,
     PROJECT_WORK_CONTEXT_OPEN_PATH, PROJECT_WORK_CONTEXT_RENEW_PATH, PROJECTS_PATH, SESSION_PATH,
-    SESSIONS_PATH, SKILL_PATH, SKILLS_PATH, TASK_PATH, TASKS_PATH, frontend_endpoints,
+    SESSIONS_PATH, SKILL_PATH, SKILLS_PATH, TASK_DIFF_COMMENT_REPLIES_PATH,
+    TASK_DIFF_COMMENT_STATUS_PATH, TASK_DIFF_COMMENTS_PATH, TASK_DIFF_PATH, TASK_PATH, TASKS_PATH,
+    frontend_endpoints,
 };
 pub use project::{
     CreateProjectRequest, CreateProjectResponse, DeleteProjectRequest, DeleteProjectResponse,
@@ -40,6 +43,13 @@ pub use task::{
     CreateTaskRequest, CreateTaskResponse, DeleteTaskRequest, DeleteTaskResponse, GetTaskRequest,
     GetTaskResponse, ListTasksRequest, ListTasksResponse, Task, TaskStatus, UpdateTaskRequest,
     UpdateTaskResponse,
+};
+pub use task_diff::{
+    CreateTaskDiffCommentRequest, CreateTaskDiffCommentResponse, GetTaskDiffRequest,
+    GetTaskDiffResponse, ListTaskDiffCommentsRequest, ListTaskDiffCommentsResponse,
+    ReplyTaskDiffCommentRequest, ReplyTaskDiffCommentResponse, SetTaskDiffCommentStatusRequest,
+    SetTaskDiffCommentStatusResponse, TaskDiffComment, TaskDiffCommentAnchor, TaskDiffCommentKind,
+    TaskDiffSide, TaskDiffThreadStatus,
 };
 use ts_rs::{Config, ExportError, TS};
 
@@ -115,6 +125,22 @@ pub fn export_typescript_bindings_to(
     UpdateTaskResponse::export(&config)?;
     DeleteTaskRequest::export(&config)?;
     DeleteTaskResponse::export(&config)?;
+
+    TaskDiffSide::export(&config)?;
+    TaskDiffThreadStatus::export(&config)?;
+    GetTaskDiffRequest::export(&config)?;
+    GetTaskDiffResponse::export(&config)?;
+    TaskDiffCommentAnchor::export(&config)?;
+    TaskDiffCommentKind::export(&config)?;
+    TaskDiffComment::export(&config)?;
+    ListTaskDiffCommentsRequest::export(&config)?;
+    ListTaskDiffCommentsResponse::export(&config)?;
+    CreateTaskDiffCommentRequest::export(&config)?;
+    CreateTaskDiffCommentResponse::export(&config)?;
+    ReplyTaskDiffCommentRequest::export(&config)?;
+    ReplyTaskDiffCommentResponse::export(&config)?;
+    SetTaskDiffCommentStatusRequest::export(&config)?;
+    SetTaskDiffCommentStatusResponse::export(&config)?;
 
     Ok(())
 }

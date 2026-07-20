@@ -4,6 +4,7 @@ mod project;
 mod project_work_context;
 mod session;
 mod task;
+mod task_diff;
 mod worktree;
 
 mod skill;
@@ -34,10 +35,17 @@ pub use skill::{
     SkillRepository, SkillRepositoryError, UpdateSkillHandler, UuidSkillIdGenerator,
 };
 pub use task::{
-    CreateTaskHandler, CreateTaskWorktreeRequest, DeleteTaskHandler, DeleteTaskWorktreeRequest,
-    GetTaskHandler, GitTaskWorktreeProvisioner, ListTasksHandler, TaskIdGenerator, TaskRepository,
-    TaskRepositoryError, TaskWorktreeDeletionMode, TaskWorktreeProvisioner,
-    TaskWorktreeProvisionerError, UpdateTaskHandler, UuidTaskIdGenerator,
+    CreateTaskHandler, CreateTaskWorktreeRequest, CreateTaskWorktreeResponse, DeleteTaskHandler,
+    DeleteTaskWorktreeRequest, GetTaskHandler, GitTaskWorktreeProvisioner, ListTasksHandler,
+    TaskIdGenerator, TaskRepository, TaskRepositoryError, TaskWorktreeDeletionMode,
+    TaskWorktreeProvisioner, TaskWorktreeProvisionerError, UpdateTaskHandler, UuidTaskIdGenerator,
+};
+pub use task_diff::{
+    CreateTaskDiffCommentHandler, GetTaskDiffHandler, GitTaskDiffReader,
+    ListTaskDiffCommentsHandler, ReadTaskDiffRequest, ReplyTaskDiffCommentHandler,
+    SetTaskDiffCommentStatusHandler, TaskDiffCommentIdGenerator, TaskDiffCommentRepository,
+    TaskDiffCommentRepositoryError, TaskDiffReader, TaskDiffReaderError, TaskDiffSnapshot,
+    UuidTaskDiffCommentIdGenerator,
 };
 pub use worktree::{
     UuidWorktreeIdGenerator, WorktreeIdGenerator, WorktreeRepository, WorktreeRepositoryError,

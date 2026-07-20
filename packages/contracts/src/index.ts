@@ -8,3 +8,4 @@ export * from "./project-work-context.js";
 export * from "./session.js";
 export * from "./skill.js";
 export * from "./task.js";
+export * from "./task_diff.js";

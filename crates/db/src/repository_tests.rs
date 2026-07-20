@@ -3,13 +3,15 @@ use std::path::PathBuf;
 use ora_application::{
     AgentDefinitionRepository, ProjectRepository, ProjectRepositoryError,
     ProjectWorkContextRepository, SessionRepository, SessionRepositoryError, SkillRepository,
-    TaskRepository, TaskRepositoryError, WorktreeRepository, WorktreeRepositoryError,
+    TaskDiffCommentRepository, TaskRepository, TaskRepositoryError, WorktreeRepository,
+    WorktreeRepositoryError,
 };
 use ora_domain::{
     AgentDefinition, AgentDefinitionId, AgentId, AuditFields, Project, ProjectId,
     ProjectWorkContext, ProjectWorkContextId, ProjectWorkContextSurface, Session, SessionId,
-    SessionStatus, Skill, SkillId, Task, TaskId, TaskStatus, Worktree, WorktreeActivity,
-    WorktreeId,
+    SessionStatus, Skill, SkillId, Task, TaskDiffAnchor, TaskDiffComment, TaskDiffCommentId,
+    TaskDiffCommentKind, TaskDiffSide, TaskDiffThreadStatus, TaskId, TaskStatus, Worktree,
+    WorktreeActivity, WorktreeId,
 };
 use ora_logging::with_trace_logging;
 use pretty_assertions::assert_eq;
@@ -18,8 +20,8 @@ use tempfile::TempDir;
 use crate::{
     DatabaseBootstrapper, DatabaseLocation, RepositoryPool, SqliteAgentDefinitionRepository,
     SqliteProjectRepository, SqliteProjectWorkContextRepository, SqliteSessionRepository,
-    SqliteSkillRepository, SqliteTaskRepository, SqliteWorktreeRepository, TimestampSource,
-    default_migration_catalog,
+    SqliteSkillRepository, SqliteTaskDiffCommentRepository, SqliteTaskRepository,
+    SqliteWorktreeRepository, TimestampSource, default_migration_catalog,
 };
 
 /// Verifies catalog repositories use stable identifiers and hide soft-deleted rows.
@@ -486,6 +488,7 @@ fn worktree_repository_supports_crud_and_soft_delete() {
         WorktreeId::new("worktree-1"),
         TaskId::new("task-1"),
         Some("feature/db-pool".to_string()),
+        ora_domain::WorktreeBaseline::recorded("base-commit").unwrap(),
         WorktreeActivity::Inactive,
         AuditFields::new(13, 13, false),
     );
@@ -509,6 +512,7 @@ fn worktree_repository_supports_crud_and_soft_delete() {
         created_worktree.id.clone(),
         created_worktree.task_id.clone(),
         None,
+        ora_domain::WorktreeBaseline::recorded("updated-base-commit").unwrap(),
         WorktreeActivity::Active,
         AuditFields::new(13, 23, false),
     );
@@ -570,6 +574,7 @@ fn repository_pool_composes_all_repository_adapters() {
         WorktreeId::new("worktree-1"),
         task.id.clone(),
         Some("feature/composition".to_string()),
+        ora_domain::WorktreeBaseline::recorded("base-commit").unwrap(),
         WorktreeActivity::Active,
         AuditFields::new(43, 43, false),
     );
@@ -605,6 +610,125 @@ fn repository_pool_composes_all_repository_adapters() {
         worktree_repository.find_worktree(&worktree.id).unwrap(),
         Some(worktree)
     );
+}
+
+/// Verifies diff discussions round-trip without collapsing thread and reply states.
+#[test]
+fn task_diff_comment_repository_persists_threads_replies_and_status() {
+    let (_temp_dir, pool) = bootstrapped_repository_pool();
+    let project_repository = SqliteProjectRepository::new(pool.clone());
+    let task_repository = SqliteTaskRepository::new(pool.clone());
+    let comment_repository = SqliteTaskDiffCommentRepository::new(pool);
+    let project = Project::new(
+        ProjectId::new("project-comments"),
+        "Ora comments",
+        "/tmp/ora-comments",
+        AuditFields::new(1, 1, false),
+    );
+    let task = Task::new(
+        TaskId::new("task-comments"),
+        project.id.clone(),
+        "Review comments",
+        TaskStatus::Doing,
+        /*worktree_id*/ None,
+        AuditFields::new(1, 1, false),
+    );
+    let thread = TaskDiffComment::new(
+        TaskDiffCommentId::new("comment-thread"),
+        task.id.clone(),
+        TaskDiffCommentKind::Thread {
+            anchor: TaskDiffAnchor {
+                diff_id: "diff-1".to_string(),
+                path: "src/main.rs".to_string(),
+                side: TaskDiffSide::New,
+                start_line: 4,
+                end_line: 5,
+                hunk_header: "@@ -1,3 +1,5 @@".to_string(),
+                line_content: "println!();".to_string(),
+            },
+            status: TaskDiffThreadStatus::Open,
+        },
+        "Please extract this.",
+        AuditFields::new(2, 2, false),
+    );
+    let reply = TaskDiffComment::new(
+        TaskDiffCommentId::new("comment-reply"),
+        task.id.clone(),
+        TaskDiffCommentKind::Reply {
+            parent_comment_id: thread.id.clone(),
+        },
+        "Done.",
+        AuditFields::new(3, 3, false),
+    );
+
+    project_repository.create_project(project).unwrap();
+    task_repository.create_task(task).unwrap();
+    assert_eq!(
+        comment_repository.create_comment(thread.clone()).unwrap(),
+        thread.clone()
+    );
+    assert_eq!(
+        comment_repository.create_comment(reply.clone()).unwrap(),
+        reply.clone()
+    );
+    assert_eq!(
+        comment_repository.list_comments(&thread.task_id).unwrap(),
+        vec![thread.clone(), reply]
+    );
+    let nested_reply = TaskDiffComment::new(
+        TaskDiffCommentId::new("comment-nested-reply"),
+        thread.task_id.clone(),
+        TaskDiffCommentKind::Reply {
+            parent_comment_id: TaskDiffCommentId::new("comment-reply"),
+        },
+        "Nested replies are invalid.",
+        AuditFields::new(3, 3, false),
+    );
+    assert!(comment_repository.create_comment(nested_reply).is_err());
+
+    let mut resolved_thread = thread;
+    resolved_thread.kind = match resolved_thread.kind {
+        TaskDiffCommentKind::Thread { anchor, .. } => TaskDiffCommentKind::Thread {
+            anchor,
+            status: TaskDiffThreadStatus::Resolved,
+        },
+        TaskDiffCommentKind::Reply { parent_comment_id } => {
+            TaskDiffCommentKind::Reply { parent_comment_id }
+        }
+    };
+    resolved_thread.audit_fields.updated_at = 4;
+    assert_eq!(
+        comment_repository
+            .update_comment(resolved_thread.clone())
+            .unwrap(),
+        resolved_thread.clone()
+    );
+    assert_eq!(
+        comment_repository
+            .find_comment(&resolved_thread.id)
+            .unwrap(),
+        Some(resolved_thread)
+    );
+
+    let other_task = Task::new(
+        TaskId::new("task-other"),
+        ProjectId::new("project-comments"),
+        "Other task",
+        TaskStatus::Todo,
+        /*worktree_id*/ None,
+        AuditFields::new(5, 5, false),
+    );
+    task_repository.create_task(other_task.clone()).unwrap();
+    let cross_task_reply = TaskDiffComment::new(
+        TaskDiffCommentId::new("cross-task-reply"),
+        other_task.id,
+        TaskDiffCommentKind::Reply {
+            parent_comment_id: TaskDiffCommentId::new("comment-thread"),
+        },
+        "Invalid parent task.",
+        AuditFields::new(6, 6, false),
+    );
+    assert!(comment_repository.create_comment(cross_task_reply).is_err());
 }
 
 /// Verifies project repositories translate SQLite statement failures into application-owned errors.

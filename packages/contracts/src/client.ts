@@ -26,6 +26,11 @@ export type ContractsClient = {
     list: ClientOperation<"listTasks">;
     update: ClientOperation<"updateTask">;
     delete: ClientOperation<"deleteTask">;
+    getDiff: ClientOperation<"getTaskDiff">;
+    listDiffComments: ClientOperation<"listTaskDiffComments">;
+    createDiffComment: ClientOperation<"createTaskDiffComment">;
+    replyDiffComment: ClientOperation<"replyTaskDiffComment">;
+    setDiffCommentStatus: ClientOperation<"setTaskDiffCommentStatus">;
   };
   session: {
     create: ClientOperation<"createSession">;
@@ -69,6 +74,11 @@ export function createContractsClient(transport: ContractTransport): ContractsCl
       list: (request) => executeOperation("listTasks", request, transport),
       update: (request) => executeOperation("updateTask", request, transport),
       delete: (request) => executeOperation("deleteTask", request, transport),
+      getDiff: (request) => executeOperation("getTaskDiff", request, transport),
+      listDiffComments: (request) => executeOperation("listTaskDiffComments", request, transport),
+      createDiffComment: (request) => executeOperation("createTaskDiffComment", request, transport),
+      replyDiffComment: (request) => executeOperation("replyTaskDiffComment", request, transport),
+      setDiffCommentStatus: (request) => executeOperation("setTaskDiffCommentStatus", request, transport),
     },
     session: {
       create: (request) => executeOperation("createSession", request, transport),

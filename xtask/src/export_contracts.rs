@@ -432,6 +432,7 @@ fn render_index_module() -> String {
     source.push_str("export * from \"./session.js\";\n");
     source.push_str("export * from \"./skill.js\";\n");
     source.push_str("export * from \"./task.js\";\n");
+    source.push_str("export * from \"./task_diff.js\";\n");
 
     source
 }
@@ -496,6 +497,16 @@ fn contract_module_for_type(type_name: &str) -> &'static str {
         "CreateTaskRequest" | "CreateTaskResponse" | "DeleteTaskRequest" | "DeleteTaskResponse"
         | "GetTaskRequest" | "GetTaskResponse" | "ListTasksRequest" | "ListTasksResponse"
         | "UpdateTaskRequest" | "UpdateTaskResponse" => "task",
+        "CreateTaskDiffCommentRequest"
+        | "CreateTaskDiffCommentResponse"
+        | "GetTaskDiffRequest"
+        | "GetTaskDiffResponse"
+        | "ListTaskDiffCommentsRequest"
+        | "ListTaskDiffCommentsResponse"
+        | "ReplyTaskDiffCommentRequest"
+        | "ReplyTaskDiffCommentResponse"
+        | "SetTaskDiffCommentStatusRequest"
+        | "SetTaskDiffCommentStatusResponse" => "task_diff",
         "CreateSessionRequest"
         | "CreateSessionResponse"
         | "DeleteSessionRequest"
@@ -649,6 +660,7 @@ mod tests {
             "session.ts",
             "skill.ts",
             "task.ts",
+            "task_diff.ts",
             "transport.ts",
         ];
 

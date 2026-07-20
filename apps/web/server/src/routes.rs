@@ -1,11 +1,14 @@
 use crate::app_state::AppState;
-use crate::handlers::{agents, health, project_work_contexts, projects, sessions, skills, tasks};
+use crate::handlers::{
+    agents, health, project_work_contexts, projects, sessions, skills, task_diffs, tasks,
+};
 use axum::Router;
 use axum::routing::{get, post};
 use ora_contracts::{
     AGENT_PATH, AGENTS_PATH, PROJECT_PATH, PROJECT_WORK_CONTEXT_OPEN_PATH,
     PROJECT_WORK_CONTEXT_RENEW_PATH, PROJECTS_PATH, SESSION_PATH, SESSIONS_PATH, SKILL_PATH,
-    SKILLS_PATH, TASK_PATH, TASKS_PATH,
+    SKILLS_PATH, TASK_DIFF_COMMENT_REPLIES_PATH, TASK_DIFF_COMMENT_STATUS_PATH,
+    TASK_DIFF_COMMENTS_PATH, TASK_DIFF_PATH, TASK_PATH, TASKS_PATH,
 };
 
 /// Builds the top-level router for health checks and the persisted CRUD routes.
@@ -37,6 +40,19 @@ pub fn build_router(app_state: AppState) -> Router {
             get(tasks::get_task)
                 .put(tasks::update_task)
                 .delete(tasks::delete_task),
+        )
+        .route(TASK_DIFF_PATH, get(task_diffs::get_task_diff))
+        .route(
+            TASK_DIFF_COMMENTS_PATH,
+            post(task_diffs::create_task_diff_comment).get(task_diffs::list_task_diff_comments),
+        )
+        .route(
+            TASK_DIFF_COMMENT_REPLIES_PATH,
+            post(task_diffs::reply_task_diff_comment),
+        )
+        .route(
+            TASK_DIFF_COMMENT_STATUS_PATH,
+            axum::routing::put(task_diffs::set_task_diff_comment_status),
         )
         .route(
             SESSIONS_PATH,
@@ -702,6 +718,104 @@ mod tests {
                 .find_worktree(&WorktreeId::new(worktree_id))
                 .unwrap(),
             None
+        );
+    }
+
+    /// Verifies task diffs and review discussions work through the public HTTP surface.
+    #[tokio::test]
+    async fn serves_task_diff_and_comment_routes() {
+        let (temp_dir, _database_path, app) = test_router();
+        let create_task_response = request_json(
+            &app,
+            Method::POST,
+            "/api/tasks",
+            json!({
+                "projectId": "project-1",
+                "title": "Review task diff",
+                "status": "todo",
+            }),
+        )
+        .await;
+        assert_eq!(create_task_response.status(), StatusCode::OK);
+        let task_json = response_json(create_task_response).await;
+        let task_id = task_json["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("response did not include a task id"));
+        let task_diff_path = format!("/api/tasks/{task_id}/diff");
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("worktrees")
+                .join(task_id)
+                .join("review.txt"),
+            "review me\n",
+        )
+        .unwrap_or_else(|error| panic!("failed to write worktree fixture: {error}"));
+
+        let diff_response = request_empty(&app, Method::GET, &task_diff_path).await;
+        assert_eq!(diff_response.status(), StatusCode::OK);
+        let diff_json = response_json(diff_response).await;
+        assert!(
+            diff_json["patch"]
+                .as_str()
+                .is_some_and(|patch| patch.contains("diff --git a/review.txt b/review.txt"))
+        );
+        let diff_id = diff_json["diffId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("diff response did not include a diff id"));
+        let comments_path = format!("{task_diff_path}/comments");
+        let create_comment_response = request_json(
+            &app,
+            Method::POST,
+            &comments_path,
+            json!({
+                "anchor": {
+                    "diffId": diff_id,
+                    "path": "review.txt",
+                    "side": "new",
+                    "startLine": 1,
+                    "endLine": 1,
+                    "hunkHeader": "@@ -0,0 +1 @@",
+                    "lineContent": "review me",
+                },
+                "body": "Please revise this line.",
+            }),
+        )
+        .await;
+        assert_eq!(create_comment_response.status(), StatusCode::OK);
+        let created_comment = response_json(create_comment_response).await["comment"].clone();
+        let comment_id = created_comment["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("comment response did not include an id"));
+        let reply_response = request_json(
+            &app,
+            Method::POST,
+            &format!("{comments_path}/{comment_id}/replies"),
+            json!({ "body": "Updated." }),
+        )
+        .await;
+        assert_eq!(reply_response.status(), StatusCode::OK);
+        let reply = response_json(reply_response).await["comment"].clone();
+        assert_eq!(reply["kind"]["parentCommentId"], json!(comment_id));
+        let status_response = request_json(
+            &app,
+            Method::PUT,
+            &format!("{comments_path}/{comment_id}/status"),
+            json!({ "status": "resolved" }),
+        )
+        .await;
+        assert_eq!(status_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(status_response).await["comment"]["kind"]["status"],
+            json!("resolved")
+        );
+        let list_response = request_empty(&app, Method::GET, &comments_path).await;
+        assert_eq!(list_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(list_response).await["comments"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
         );
     }
 

@@ -5,6 +5,7 @@ import type { OpenProjectWorkContextRequest, OpenProjectWorkContextResponse, Ren
 import type { CreateSessionRequest, CreateSessionResponse, DeleteSessionRequest, DeleteSessionResponse, GetSessionRequest, GetSessionResponse, ListSessionsRequest, ListSessionsResponse, UpdateSessionRequest, UpdateSessionResponse } from "./session.js";
 import type { CreateSkillRequest, CreateSkillResponse, DeleteSkillRequest, DeleteSkillResponse, GetSkillRequest, GetSkillResponse, ListSkillsRequest, ListSkillsResponse, UpdateSkillRequest, UpdateSkillResponse } from "./skill.js";
 import type { CreateTaskRequest, CreateTaskResponse, DeleteTaskRequest, DeleteTaskResponse, GetTaskRequest, GetTaskResponse, ListTasksRequest, ListTasksResponse, UpdateTaskRequest, UpdateTaskResponse } from "./task.js";
+import type { CreateTaskDiffCommentRequest, CreateTaskDiffCommentResponse, GetTaskDiffRequest, GetTaskDiffResponse, ListTaskDiffCommentsRequest, ListTaskDiffCommentsResponse, ReplyTaskDiffCommentRequest, ReplyTaskDiffCommentResponse, SetTaskDiffCommentStatusRequest, SetTaskDiffCommentStatusResponse } from "./task_diff.js";
 import type { HttpMethod } from "./transport.js";
 
 export type EndpointPathParam = {
@@ -35,6 +36,11 @@ export type RequestByOperation = {
   listTasks: ListTasksRequest;
   updateTask: UpdateTaskRequest;
   deleteTask: DeleteTaskRequest;
+  getTaskDiff: GetTaskDiffRequest;
+  listTaskDiffComments: ListTaskDiffCommentsRequest;
+  createTaskDiffComment: CreateTaskDiffCommentRequest;
+  replyTaskDiffComment: ReplyTaskDiffCommentRequest;
+  setTaskDiffCommentStatus: SetTaskDiffCommentStatusRequest;
   createSession: CreateSessionRequest;
   getSession: GetSessionRequest;
   listSessions: ListSessionsRequest;
@@ -65,6 +71,11 @@ export type ResponseByOperation = {
   listTasks: ListTasksResponse;
   updateTask: UpdateTaskResponse;
   deleteTask: DeleteTaskResponse;
+  getTaskDiff: GetTaskDiffResponse;
+  listTaskDiffComments: ListTaskDiffCommentsResponse;
+  createTaskDiffComment: CreateTaskDiffCommentResponse;
+  replyTaskDiffComment: ReplyTaskDiffCommentResponse;
+  setTaskDiffCommentStatus: SetTaskDiffCommentStatusResponse;
   createSession: CreateSessionResponse;
   getSession: GetSessionResponse;
   listSessions: ListSessionsResponse;
@@ -192,6 +203,51 @@ export const endpoints = {
     responseType: "DeleteTaskResponse",
     pathParams: [{ rustFieldName: "task_id", wireName: "taskId" }],
     hasJsonBody: false,
+  },
+  getTaskDiff: {
+    operationName: "getTaskDiff",
+    method: "GET",
+    pathTemplate: "/api/tasks/{taskId}/diff",
+    requestType: "GetTaskDiffRequest",
+    responseType: "GetTaskDiffResponse",
+    pathParams: [{ rustFieldName: "task_id", wireName: "taskId" }],
+    hasJsonBody: false,
+  },
+  listTaskDiffComments: {
+    operationName: "listTaskDiffComments",
+    method: "GET",
+    pathTemplate: "/api/tasks/{taskId}/diff/comments",
+    requestType: "ListTaskDiffCommentsRequest",
+    responseType: "ListTaskDiffCommentsResponse",
+    pathParams: [{ rustFieldName: "task_id", wireName: "taskId" }],
+    hasJsonBody: false,
+  },
+  createTaskDiffComment: {
+    operationName: "createTaskDiffComment",
+    method: "POST",
+    pathTemplate: "/api/tasks/{taskId}/diff/comments",
+    requestType: "CreateTaskDiffCommentRequest",
+    responseType: "CreateTaskDiffCommentResponse",
+    pathParams: [{ rustFieldName: "task_id", wireName: "taskId" }],
+    hasJsonBody: true,
+  },
+  replyTaskDiffComment: {
+    operationName: "replyTaskDiffComment",
+    method: "POST",
+    pathTemplate: "/api/tasks/{taskId}/diff/comments/{commentId}/replies",
+    requestType: "ReplyTaskDiffCommentRequest",
+    responseType: "ReplyTaskDiffCommentResponse",
+    pathParams: [{ rustFieldName: "task_id", wireName: "taskId" }, { rustFieldName: "comment_id", wireName: "commentId" }],
+    hasJsonBody: true,
+  },
+  setTaskDiffCommentStatus: {
+    operationName: "setTaskDiffCommentStatus",
+    method: "PUT",
+    pathTemplate: "/api/tasks/{taskId}/diff/comments/{commentId}/status",
+    requestType: "SetTaskDiffCommentStatusRequest",
+    responseType: "SetTaskDiffCommentStatusResponse",
+    pathParams: [{ rustFieldName: "task_id", wireName: "taskId" }, { rustFieldName: "comment_id", wireName: "commentId" }],
+    hasJsonBody: true,
   },
   createSession: {
     operationName: "createSession",

@@ -1,4 +1,6 @@
-use crate::service::{AgentApi, ProjectApi, ProjectWorkContextApi, SessionApi, SkillApi, TaskApi};
+use crate::service::{
+    AgentApi, ProjectApi, ProjectWorkContextApi, SessionApi, SkillApi, TaskApi, TaskDiffApi,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -9,6 +11,7 @@ pub struct AppState {
     project_api: Arc<ProjectApi>,
     project_work_context_api: Arc<ProjectWorkContextApi>,
     task_api: Arc<TaskApi>,
+    task_diff_api: Arc<TaskDiffApi>,
     session_api: Arc<SessionApi>,
     skill_api: Arc<SkillApi>,
     ready: Arc<AtomicBool>,
@@ -21,6 +24,7 @@ impl AppState {
         project_api: Arc<ProjectApi>,
         project_work_context_api: Arc<ProjectWorkContextApi>,
         task_api: Arc<TaskApi>,
+        task_diff_api: Arc<TaskDiffApi>,
         session_api: Arc<SessionApi>,
         skill_api: Arc<SkillApi>,
     ) -> Self {
@@ -29,6 +33,7 @@ impl AppState {
             project_api,
             project_work_context_api,
             task_api,
+            task_diff_api,
             session_api,
             skill_api,
             ready: Arc::new(AtomicBool::new(false)),
@@ -53,6 +58,11 @@ impl AppState {
     /// Returns the shared task API that routes delegate into.
     pub fn task_api(&self) -> &Arc<TaskApi> {
         &self.task_api
+    }
+
+    /// Returns the shared task diff API that routes delegate into.
+    pub fn task_diff_api(&self) -> &Arc<TaskDiffApi> {
+        &self.task_diff_api
     }
 
     /// Returns the shared session API that routes delegate into.

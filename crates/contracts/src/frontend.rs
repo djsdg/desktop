@@ -42,6 +42,12 @@ pub const PROJECT_WORK_CONTEXT_OPEN_PATH: &str = "/api/project-work-contexts/ope
 pub const PROJECT_WORK_CONTEXT_RENEW_PATH: &str = "/api/project-work-contexts/renew";
 pub const TASKS_PATH: &str = "/api/tasks";
 pub const TASK_PATH: &str = "/api/tasks/{taskId}";
+pub const TASK_DIFF_PATH: &str = "/api/tasks/{taskId}/diff";
+pub const TASK_DIFF_COMMENTS_PATH: &str = "/api/tasks/{taskId}/diff/comments";
+pub const TASK_DIFF_COMMENT_REPLIES_PATH: &str =
+    "/api/tasks/{taskId}/diff/comments/{commentId}/replies";
+pub const TASK_DIFF_COMMENT_STATUS_PATH: &str =
+    "/api/tasks/{taskId}/diff/comments/{commentId}/status";
 pub const SESSIONS_PATH: &str = "/api/sessions";
 pub const SESSION_PATH: &str = "/api/sessions/{sessionId}";
 pub const SKILLS_PATH: &str = "/api/skills";
@@ -56,6 +62,10 @@ const PROJECT_ID_PATH_PARAM: FrontendPathParam = FrontendPathParam {
 const TASK_ID_PATH_PARAM: FrontendPathParam = FrontendPathParam {
     rust_field_name: "task_id",
     wire_name: "taskId",
+};
+const COMMENT_ID_PATH_PARAM: FrontendPathParam = FrontendPathParam {
+    rust_field_name: "comment_id",
+    wire_name: "commentId",
 };
 const SESSION_ID_PATH_PARAM: FrontendPathParam = FrontendPathParam {
     rust_field_name: "session_id",
@@ -79,6 +89,7 @@ const AGENT_NAMESPACE: &str = "agent";
 
 const PROJECT_PATH_PARAMS: &[FrontendPathParam] = &[PROJECT_ID_PATH_PARAM];
 const TASK_PATH_PARAMS: &[FrontendPathParam] = &[TASK_ID_PATH_PARAM];
+const TASK_COMMENT_PATH_PARAMS: &[FrontendPathParam] = &[TASK_ID_PATH_PARAM, COMMENT_ID_PATH_PARAM];
 const SESSION_PATH_PARAMS: &[FrontendPathParam] = &[SESSION_ID_PATH_PARAM];
 const SKILL_PATH_PARAMS: &[FrontendPathParam] = &[SKILL_ID_PATH_PARAM];
 const AGENT_PATH_PARAMS: &[FrontendPathParam] = &[AGENT_ID_PATH_PARAM];
@@ -216,6 +227,61 @@ const FRONTEND_ENDPOINTS: &[FrontendEndpoint] = &[
         response_type: "DeleteTaskResponse",
         path_params: TASK_PATH_PARAMS,
         has_json_body: false,
+    },
+    FrontendEndpoint {
+        operation_name: "getTaskDiff",
+        namespace: TASK_NAMESPACE,
+        member_name: "getDiff",
+        method: FrontendHttpMethod::Get,
+        path_template: TASK_DIFF_PATH,
+        request_type: "GetTaskDiffRequest",
+        response_type: "GetTaskDiffResponse",
+        path_params: TASK_PATH_PARAMS,
+        has_json_body: false,
+    },
+    FrontendEndpoint {
+        operation_name: "listTaskDiffComments",
+        namespace: TASK_NAMESPACE,
+        member_name: "listDiffComments",
+        method: FrontendHttpMethod::Get,
+        path_template: TASK_DIFF_COMMENTS_PATH,
+        request_type: "ListTaskDiffCommentsRequest",
+        response_type: "ListTaskDiffCommentsResponse",
+        path_params: TASK_PATH_PARAMS,
+        has_json_body: false,
+    },
+    FrontendEndpoint {
+        operation_name: "createTaskDiffComment",
+        namespace: TASK_NAMESPACE,
+        member_name: "createDiffComment",
+        method: FrontendHttpMethod::Post,
+        path_template: TASK_DIFF_COMMENTS_PATH,
+        request_type: "CreateTaskDiffCommentRequest",
+        response_type: "CreateTaskDiffCommentResponse",
+        path_params: TASK_PATH_PARAMS,
+        has_json_body: true,
+    },
+    FrontendEndpoint {
+        operation_name: "replyTaskDiffComment",
+        namespace: TASK_NAMESPACE,
+        member_name: "replyDiffComment",
+        method: FrontendHttpMethod::Post,
+        path_template: TASK_DIFF_COMMENT_REPLIES_PATH,
+        request_type: "ReplyTaskDiffCommentRequest",
+        response_type: "ReplyTaskDiffCommentResponse",
+        path_params: TASK_COMMENT_PATH_PARAMS,
+        has_json_body: true,
+    },
+    FrontendEndpoint {
+        operation_name: "setTaskDiffCommentStatus",
+        namespace: TASK_NAMESPACE,
+        member_name: "setDiffCommentStatus",
+        method: FrontendHttpMethod::Put,
+        path_template: TASK_DIFF_COMMENT_STATUS_PATH,
+        request_type: "SetTaskDiffCommentStatusRequest",
+        response_type: "SetTaskDiffCommentStatusResponse",
+        path_params: TASK_COMMENT_PATH_PARAMS,
+        has_json_body: true,
     },
     FrontendEndpoint {
         operation_name: "createSession",
@@ -394,8 +460,9 @@ mod tests {
     use super::{
         AGENT_PATH, AGENTS_PATH, FrontendEndpoint, FrontendHttpMethod, FrontendPathParam,
         PROJECT_PATH, PROJECT_WORK_CONTEXT_OPEN_PATH, PROJECT_WORK_CONTEXT_RENEW_PATH,
-        PROJECTS_PATH, SESSION_PATH, SESSIONS_PATH, SKILL_PATH, SKILLS_PATH, TASK_PATH, TASKS_PATH,
-        frontend_endpoints,
+        PROJECTS_PATH, SESSION_PATH, SESSIONS_PATH, SKILL_PATH, SKILLS_PATH,
+        TASK_DIFF_COMMENT_REPLIES_PATH, TASK_DIFF_COMMENT_STATUS_PATH, TASK_DIFF_COMMENTS_PATH,
+        TASK_DIFF_PATH, TASK_PATH, TASKS_PATH, frontend_endpoints,
     };
     use pretty_assertions::assert_eq;
     use std::collections::BTreeSet;
@@ -555,6 +622,88 @@ mod tests {
                         wire_name: "taskId",
                     }],
                     has_json_body: false,
+                },
+                FrontendEndpoint {
+                    operation_name: "getTaskDiff",
+                    namespace: "task",
+                    member_name: "getDiff",
+                    method: FrontendHttpMethod::Get,
+                    path_template: TASK_DIFF_PATH,
+                    request_type: "GetTaskDiffRequest",
+                    response_type: "GetTaskDiffResponse",
+                    path_params: &[FrontendPathParam {
+                        rust_field_name: "task_id",
+                        wire_name: "taskId",
+                    }],
+                    has_json_body: false,
+                },
+                FrontendEndpoint {
+                    operation_name: "listTaskDiffComments",
+                    namespace: "task",
+                    member_name: "listDiffComments",
+                    method: FrontendHttpMethod::Get,
+                    path_template: TASK_DIFF_COMMENTS_PATH,
+                    request_type: "ListTaskDiffCommentsRequest",
+                    response_type: "ListTaskDiffCommentsResponse",
+                    path_params: &[FrontendPathParam {
+                        rust_field_name: "task_id",
+                        wire_name: "taskId",
+                    }],
+                    has_json_body: false,
+                },
+                FrontendEndpoint {
+                    operation_name: "createTaskDiffComment",
+                    namespace: "task",
+                    member_name: "createDiffComment",
+                    method: FrontendHttpMethod::Post,
+                    path_template: TASK_DIFF_COMMENTS_PATH,
+                    request_type: "CreateTaskDiffCommentRequest",
+                    response_type: "CreateTaskDiffCommentResponse",
+                    path_params: &[FrontendPathParam {
+                        rust_field_name: "task_id",
+                        wire_name: "taskId",
+                    }],
+                    has_json_body: true,
+                },
+                FrontendEndpoint {
+                    operation_name: "replyTaskDiffComment",
+                    namespace: "task",
+                    member_name: "replyDiffComment",
+                    method: FrontendHttpMethod::Post,
+                    path_template: TASK_DIFF_COMMENT_REPLIES_PATH,
+                    request_type: "ReplyTaskDiffCommentRequest",
+                    response_type: "ReplyTaskDiffCommentResponse",
+                    path_params: &[
+                        FrontendPathParam {
+                            rust_field_name: "task_id",
+                            wire_name: "taskId",
+                        },
+                        FrontendPathParam {
+                            rust_field_name: "comment_id",
+                            wire_name: "commentId",
+                        },
+                    ],
+                    has_json_body: true,
+                },
+                FrontendEndpoint {
+                    operation_name: "setTaskDiffCommentStatus",
+                    namespace: "task",
+                    member_name: "setDiffCommentStatus",
+                    method: FrontendHttpMethod::Put,
+                    path_template: TASK_DIFF_COMMENT_STATUS_PATH,
+                    request_type: "SetTaskDiffCommentStatusRequest",
+                    response_type: "SetTaskDiffCommentStatusResponse",
+                    path_params: &[
+                        FrontendPathParam {
+                            rust_field_name: "task_id",
+                            wire_name: "taskId",
+                        },
+                        FrontendPathParam {
+                            rust_field_name: "comment_id",
+                            wire_name: "commentId",
+                        },
+                    ],
+                    has_json_body: true,
                 },
                 FrontendEndpoint {
                     operation_name: "createSession",
