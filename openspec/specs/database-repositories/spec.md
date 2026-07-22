@@ -61,7 +61,9 @@ The system SHALL persist and load `ora-domain` `Project`, `Task`, `Session`, and
 
 #### Scenario: Worktree row is loaded from SQLite
 - **WHEN** `ora-db` reads a `worktrees` row
-- **THEN** it converts the persisted `is_active` integer into `ora_domain::WorktreeActivity`, preserves the optional `branch_name`, and returns a full `ora_domain::Worktree` with audit fields populated from the row
+- **THEN** it converts the persisted `lifecycle` integer into `ora_domain::WorktreeLifecycle`, including `ProvisioningPending`, `Active`, and `RemovalPending`
+- **THEN** rows with both `worktree_root` and `branch_name` become a managed identity, while historical rows without a persisted root become an explicit legacy-unavailable identity
+- **THEN** it returns a full `ora_domain::Worktree` with project ownership, baseline, and audit fields populated
 
 ### Requirement: Repository implementations SHALL preserve CRUD replacement semantics
 The system SHALL make the `create_*` and `update_*` port operations behave as full domain snapshot persistence operations so the returned entity matches the state stored in SQLite after the write succeeds.

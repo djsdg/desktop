@@ -27,6 +27,23 @@ pub enum GitlancerError {
         byte_count: usize,
         max_byte_count: usize,
     },
+
+    /// Returned when a concurrent commit or checkout change prevents a coherent diff snapshot.
+    #[error(
+        "worktree HEAD changed while generating task diff: {before_commit_id} -> {after_commit_id}"
+    )]
+    DiffHeadChanged {
+        before_commit_id: String,
+        after_commit_id: String,
+    },
+
+    /// Returned when an Ora worktree identity marker cannot be read or written safely.
+    #[error("failed to access worktree identity marker {path:?}: {source}")]
+    WorktreeIdentityIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Represents invalid repository and worktree states detected before execution.
@@ -52,6 +69,10 @@ pub enum DomainError {
     #[error("cannot delete the main worktree for repository {0:?}")]
     MainWorktreeDeletionUnsupported(PathBuf),
 
+    /// Returned when destructive removal lacks an Ora identity marker that can survive path reuse.
+    #[error("cannot safely delete an unmanaged worktree without an identity marker: {0:?}")]
+    UnmanagedWorktreeDeletionUnsupported(PathBuf),
+
     /// Returned when a path cannot be safely expressed relative to the worktree root.
     #[error("path {path:?} is outside worktree {worktree:?}")]
     PathOutsideWorktree { path: PathBuf, worktree: PathBuf },
@@ -59,6 +80,36 @@ pub enum DomainError {
     /// Returned when a worktree does not belong to the repository a caller supplied.
     #[error("worktree {worktree:?} does not belong to repository {repo:?}")]
     WorktreeMismatch { worktree: PathBuf, repo: PathBuf },
+
+    /// Returned when a stale handle points at a path now owned by a different Git worktree identity.
+    #[error(
+        "worktree {worktree:?} changed identity from git dir {expected_git_dir:?}, branch {expected_branch:?}, token {expected_identity_token:?} to git dir {actual_git_dir:?}, branch {actual_branch:?}, token {actual_identity_token:?}"
+    )]
+    WorktreeIdentityChanged {
+        worktree: Box<PathBuf>,
+        expected_git_dir: Box<PathBuf>,
+        actual_git_dir: Box<PathBuf>,
+        expected_branch: Option<String>,
+        actual_branch: Option<String>,
+        expected_identity_token: Option<Box<str>>,
+        actual_identity_token: Option<Box<str>>,
+    },
+
+    /// Returned when a caller supplies a branch name that Git cannot represent safely as a local ref.
+    #[error("invalid local branch name: {0:?}")]
+    InvalidBranchName(String),
+
+    /// Returned when a caller supplies a value that is not a full SHA-1 or SHA-256 object ID.
+    #[error("invalid commit object id: {0:?}")]
+    InvalidCommitId(String),
+
+    /// Returned when a path cannot satisfy the repository-relative path invariant.
+    #[error("invalid repository-relative path: {0:?}")]
+    InvalidRepoRelativePath(PathBuf),
+
+    /// Returned when a worktree identity marker is empty, oversized, or contains unsafe bytes.
+    #[error("invalid worktree identity token: {0:?}")]
+    InvalidWorktreeIdentityToken(String),
 }
 
 /// Represents process-level failures produced while invoking the Git CLI.
@@ -71,6 +122,22 @@ pub enum GitExecError {
     /// Returned when the process cannot even be spawned.
     #[error("failed to spawn git with args {args:?}: {source}")]
     SpawnFailed {
+        args: Vec<String>,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Returned when the spawned Git process cannot be enrolled in a managed process tree.
+    #[error("failed to manage git process tree for args {args:?}: {source}")]
+    ProcessTreeSetupFailed {
+        args: Vec<String>,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Returned when the operating system refuses a requested tree-wide Git termination.
+    #[error("failed to terminate git process tree for args {args:?}: {source}")]
+    ProcessTreeTerminationFailed {
         args: Vec<String>,
         #[source]
         source: std::io::Error,
@@ -96,6 +163,10 @@ pub enum GitExecError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Returned when a Git process exceeds the runner's execution deadline.
+    #[error("git timed out after {timeout_ms} ms for args {args:?}")]
+    TimedOut { args: Vec<String>, timeout_ms: u64 },
 }
 
 /// Represents deterministic failures while decoding Git porcelain or plumbing output.
@@ -105,6 +176,10 @@ pub enum ParseError {
     #[error("expected at least one non-empty output line")]
     MissingLine,
 
+    /// Returned when commit metadata does not contain a full Git object identifier.
+    #[error("invalid commit metadata output")]
+    InvalidCommit,
+
     /// Returned when the worktree listing cannot be decoded into structured records.
     #[error("invalid worktree list output")]
     InvalidWorktreeList,
@@ -112,8 +187,4 @@ pub enum ParseError {
     /// Returned when the status listing cannot be decoded into structured records.
     #[error("invalid status output")]
     InvalidStatus,
-
-    /// Returned when a parser slot exists but the typed parser is not implemented yet.
-    #[error("parser for feature {feature} is not implemented yet")]
-    Unimplemented { feature: &'static str },
 }

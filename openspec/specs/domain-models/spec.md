@@ -6,7 +6,7 @@ The Rust domain layer SHALL define first-class models for every table declared i
 - **THEN** they can construct and use typed models for each schema table without importing transport-specific or persistence-specific modules
 
 ### Requirement: Numeric category fields use enums in the domain layer
-The domain layer SHALL represent numeric category columns with Rust enums instead of raw numeric fields. This includes task status, worktree active state, virtual entry kind, and session status.
+The domain layer SHALL represent numeric category columns with Rust enums instead of raw numeric fields. This includes task status, durable worktree lifecycle (`ProvisioningPending`, `Active`, and `RemovalPending`), virtual entry kind, and session status.
 
 #### Scenario: Callers inspect categorical state
 - **WHEN** application or transport code reads a domain model with a categorical field
@@ -25,6 +25,14 @@ The domain models SHALL use optional fields only for columns that are nullable i
 #### Scenario: Caller constructs a required entity
 - **WHEN** a caller creates a model for a schema row with required columns
 - **THEN** the type requires all non-nullable fields to be present and only allows absence for nullable columns
+
+### Requirement: Managed worktree identity is explicit
+New task worktrees SHALL use `WorktreeIdentity::Managed` with a non-empty absolute persisted checkout root and a non-empty branch name. Rows created before trusted identity persistence SHALL decode as `LegacyUnavailable` rather than using independent optional root and branch fields that can form inconsistent states.
+
+#### Scenario: A managed worktree is constructed
+- **WHEN** the application creates a new task worktree domain value
+- **THEN** construction rejects an empty or relative root and an empty branch
+- **THEN** callers can obtain both trusted identity values from the same managed state
 
 ### Requirement: Session agent identifiers SHALL use a dedicated domain type
 The domain layer SHALL represent `Session.agent_id` with a dedicated `ora_domain::AgentId` value instead of a raw string. `AgentId` SHALL remain string-compatible for serde boundaries, and the domain layer SHALL expose the known terminal session agent identifier through that type so callers can depend on a canonical built-in value.

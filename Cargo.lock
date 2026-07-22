@@ -624,6 +624,7 @@ dependencies = [
 name = "gitlancer"
 version = "0.0.0"
 dependencies = [
+ "ora-process",
  "pretty_assertions",
  "thiserror 2.0.18",
 ]

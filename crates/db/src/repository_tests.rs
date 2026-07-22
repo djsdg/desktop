@@ -7,11 +7,11 @@ use ora_application::{
     WorktreeRepositoryError,
 };
 use ora_domain::{
-    AgentDefinition, AgentDefinitionId, AgentId, AuditFields, Project, ProjectId,
-    ProjectWorkContext, ProjectWorkContextId, ProjectWorkContextSurface, Session, SessionId,
-    SessionStatus, Skill, SkillId, Task, TaskDiffAnchor, TaskDiffComment, TaskDiffCommentId,
-    TaskDiffCommentKind, TaskDiffSide, TaskDiffThreadStatus, TaskId, TaskStatus, Worktree,
-    WorktreeActivity, WorktreeId,
+    AgentDefinition, AgentDefinitionId, AgentId, AuditFields, ManagedWorktreeIdentity, Project,
+    ProjectId, ProjectWorkContext, ProjectWorkContextId, ProjectWorkContextSurface, Session,
+    SessionId, SessionStatus, Skill, SkillId, Task, TaskDiffAnchor, TaskDiffComment,
+    TaskDiffCommentId, TaskDiffCommentKind, TaskDiffSide, TaskDiffThreadStatus, TaskId, TaskStatus,
+    Worktree, WorktreeId, WorktreeLifecycle,
 };
 use ora_logging::with_trace_logging;
 use pretty_assertions::assert_eq;
@@ -23,6 +23,11 @@ use crate::{
     SqliteSkillRepository, SqliteTaskDiffCommentRepository, SqliteTaskRepository,
     SqliteWorktreeRepository, TimestampSource, default_migration_catalog,
 };
+
+/// Builds a platform-native absolute root for persisted worktree fixtures.
+fn managed_worktree_root(name: &str) -> PathBuf {
+    std::env::temp_dir().join("ora-db-worktrees").join(name)
+}
 
 /// Verifies catalog repositories use stable identifiers and hide soft-deleted rows.
 #[test]
@@ -484,12 +489,17 @@ fn session_repository_supports_crud_and_soft_delete() {
 fn worktree_repository_supports_crud_and_soft_delete() {
     let (_temp_dir, pool) = bootstrapped_repository_pool();
     let repository = SqliteWorktreeRepository::new(pool);
-    let created_worktree = Worktree::new(
+    let created_worktree = Worktree::managed(
         WorktreeId::new("worktree-1"),
         TaskId::new("task-1"),
-        Some("feature/db-pool".to_string()),
+        ProjectId::new("project-1"),
+        ManagedWorktreeIdentity::new(
+            managed_worktree_root("task-1"),
+            "feature/db-pool".to_string(),
+        )
+        .unwrap(),
         ora_domain::WorktreeBaseline::recorded("base-commit").unwrap(),
-        WorktreeActivity::Inactive,
+        WorktreeLifecycle::Active,
         AuditFields::new(13, 13, false),
     );
 
@@ -508,12 +518,17 @@ fn worktree_repository_supports_crud_and_soft_delete() {
         vec![created_worktree.clone()]
     );
 
-    let updated_worktree = Worktree::new(
+    let updated_worktree = Worktree::managed(
         created_worktree.id.clone(),
         created_worktree.task_id.clone(),
-        None,
+        created_worktree.project_id.clone(),
+        ManagedWorktreeIdentity::new(
+            managed_worktree_root("task-1"),
+            "feature/db-pool".to_string(),
+        )
+        .unwrap(),
         ora_domain::WorktreeBaseline::recorded("updated-base-commit").unwrap(),
-        WorktreeActivity::Active,
+        WorktreeLifecycle::RemovalPending,
         AuditFields::new(13, 23, false),
     );
 
@@ -570,12 +585,17 @@ fn repository_pool_composes_all_repository_adapters() {
         SessionStatus::Running,
         AuditFields::new(42, 42, false),
     );
-    let worktree = Worktree::new(
+    let worktree = Worktree::managed(
         WorktreeId::new("worktree-1"),
         task.id.clone(),
-        Some("feature/composition".to_string()),
+        task.project_id.clone(),
+        ManagedWorktreeIdentity::new(
+            managed_worktree_root("task-1"),
+            "feature/composition".to_string(),
+        )
+        .unwrap(),
         ora_domain::WorktreeBaseline::recorded("base-commit").unwrap(),
-        WorktreeActivity::Active,
+        WorktreeLifecycle::Active,
         AuditFields::new(43, 43, false),
     );
 
@@ -785,7 +805,7 @@ fn session_repository_reports_row_mapping_failures() {
     );
 }
 
-/// Verifies worktree repositories translate invalid persisted activity values into application-owned errors.
+/// Verifies worktree repositories translate invalid persisted lifecycle values into application-owned errors.
 #[test]
 fn worktree_repository_reports_row_mapping_failures() {
     let (_temp_dir, pool) = bootstrapped_repository_pool();
@@ -796,7 +816,7 @@ fn worktree_repository_reports_row_mapping_failures() {
     assert_eq!(
         repository.find_worktree(&WorktreeId::new("worktree-invalid")),
         Err(WorktreeRepositoryError::OperationFailed(
-            "domain model error: invalid worktree activity value: 99".to_string(),
+            "domain model error: invalid worktree lifecycle value: 99".to_string(),
         ))
     );
 }
@@ -869,15 +889,16 @@ fn insert_invalid_session_row(pool: &RepositoryPool) {
     .unwrap();
 }
 
-/// Inserts one worktree row with an invalid activity integer for row-mapping error coverage.
+/// Inserts one worktree row with an invalid lifecycle integer for row-mapping error coverage.
 fn insert_invalid_worktree_row(pool: &RepositoryPool) {
     pool.with_connection(|connection| {
         connection.execute(
-            "INSERT INTO worktrees (id, task_id, branch_name, is_active, created_at, updated_at, is_deleted)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO worktrees (id, task_id, project_id, branch_name, lifecycle, created_at, updated_at, is_deleted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 "worktree-invalid",
                 "task-1",
+                "project-1",
                 Option::<String>::None,
                 99,
                 62,

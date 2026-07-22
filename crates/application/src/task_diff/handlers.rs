@@ -14,14 +14,14 @@ use ora_domain::{
     AuditFields, Task, TaskDiffAnchor, TaskDiffComment, TaskDiffCommentId, TaskDiffCommentKind,
     TaskDiffThreadStatus, TaskId, Worktree,
 };
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 /// Computes the complete task worktree diff without exposing filesystem paths to callers.
 pub struct GetTaskDiffHandler<TaskRepositoryPort, WorktreeRepositoryPort, DiffReader> {
     task_repository: TaskRepositoryPort,
     worktree_repository: WorktreeRepositoryPort,
     diff_reader: DiffReader,
-    work_dir: PathBuf,
+    project_id: ora_domain::ProjectId,
 }
 
 impl<TaskRepositoryPort, WorktreeRepositoryPort, DiffReader>
@@ -32,13 +32,13 @@ impl<TaskRepositoryPort, WorktreeRepositoryPort, DiffReader>
         task_repository: TaskRepositoryPort,
         worktree_repository: WorktreeRepositoryPort,
         diff_reader: DiffReader,
-        work_dir: PathBuf,
+        project_id: ora_domain::ProjectId,
     ) -> Self {
         Self {
             task_repository,
             worktree_repository,
             diff_reader,
-            work_dir,
+            project_id,
         }
     }
 }
@@ -56,14 +56,21 @@ where
         request: GetTaskDiffRequest,
     ) -> Result<GetTaskDiffResponse, ApplicationError> {
         let task_id = TaskId::new(request.task_id);
-        let (task, worktree) =
-            load_task_worktree(&self.task_repository, &self.worktree_repository, &task_id)?;
+        let (_task, worktree) = load_task_worktree(
+            &self.task_repository,
+            &self.worktree_repository,
+            &self.project_id,
+            &task_id,
+        )?;
         let base_commit_id = recorded_baseline(&worktree)?;
+        let expected_branch_name = trusted_branch_name(&worktree)?;
 
         let snapshot = self
             .diff_reader
             .read_task_diff(ReadTaskDiffRequest {
-                worktree_path: self.work_dir.join(task.id.as_ref()),
+                expected_worktree_id: worktree.id.clone(),
+                worktree_path: trusted_worktree_root(&worktree)?.to_path_buf(),
+                expected_branch_name: expected_branch_name.to_string(),
                 base_commit_id: base_commit_id.to_string(),
             })
             .map_err(ApplicationError::from_task_diff_reader_error)?;
@@ -135,7 +142,7 @@ pub struct CreateTaskDiffCommentHandler<
     comment_repository: CommentRepository,
     comment_id_generator: CommentIdGenerator,
     clock: ClockSource,
-    work_dir: PathBuf,
+    project_id: ora_domain::ProjectId,
 }
 
 impl<
@@ -163,7 +170,7 @@ impl<
         comment_repository: CommentRepository,
         comment_id_generator: CommentIdGenerator,
         clock: ClockSource,
-        work_dir: PathBuf,
+        project_id: ora_domain::ProjectId,
     ) -> Self {
         Self {
             task_repository,
@@ -172,7 +179,7 @@ impl<
             comment_repository,
             comment_id_generator,
             clock,
-            work_dir,
+            project_id,
         }
     }
 }
@@ -207,9 +214,14 @@ where
         request: CreateTaskDiffCommentRequest,
     ) -> Result<CreateTaskDiffCommentResponse, ApplicationError> {
         let task_id = TaskId::new(request.task_id);
-        let (task, worktree) =
-            load_task_worktree(&self.task_repository, &self.worktree_repository, &task_id)?;
+        let (_task, worktree) = load_task_worktree(
+            &self.task_repository,
+            &self.worktree_repository,
+            &self.project_id,
+            &task_id,
+        )?;
         let base_commit_id = recorded_baseline(&worktree)?;
+        let expected_branch_name = trusted_branch_name(&worktree)?;
         validate_comment_body(&request.body)?;
         validate_anchor(
             &request.anchor.diff_id,
@@ -220,7 +232,9 @@ where
         let snapshot = self
             .diff_reader
             .read_task_diff(ReadTaskDiffRequest {
-                worktree_path: self.work_dir.join(task.id.as_ref()),
+                expected_worktree_id: worktree.id.clone(),
+                worktree_path: trusted_worktree_root(&worktree)?.to_path_buf(),
+                expected_branch_name: expected_branch_name.to_string(),
                 base_commit_id: base_commit_id.to_string(),
             })
             .map_err(ApplicationError::from_task_diff_reader_error)?;
@@ -270,6 +284,15 @@ fn recorded_baseline(worktree: &Worktree) -> Result<&str, ApplicationError> {
         .baseline
         .commit_id()
         .ok_or(ApplicationError::TaskDiffBaselineUnavailable)
+}
+
+/// Returns the persisted branch identity required to prevent a replacement checkout from serving a task diff.
+fn trusted_branch_name(worktree: &Worktree) -> Result<&str, ApplicationError> {
+    worktree
+        .branch_name()
+        .ok_or_else(|| ApplicationError::TaskDiff {
+            message: "task worktree has no trusted branch identity".to_string(),
+        })
 }
 
 /// Creates one reply beneath an existing task diff discussion message.
@@ -433,6 +456,7 @@ where
 fn load_task_worktree<TaskRepositoryPort, WorktreeRepositoryPort>(
     task_repository: &TaskRepositoryPort,
     worktree_repository: &WorktreeRepositoryPort,
+    configured_project_id: &ora_domain::ProjectId,
     task_id: &TaskId,
 ) -> Result<(Task, Worktree), ApplicationError>
 where
@@ -440,6 +464,12 @@ where
     WorktreeRepositoryPort: WorktreeRepository,
 {
     let task = ensure_task_exists(task_repository, task_id)?;
+    if task.project_id != *configured_project_id {
+        return Err(ApplicationError::TaskProjectMismatch {
+            expected_project_id: configured_project_id.to_string(),
+            actual_project_id: task.project_id.to_string(),
+        });
+    }
     let worktree_id = task
         .worktree_id
         .as_ref()
@@ -457,8 +487,26 @@ where
             message: "task worktree ownership does not match persisted task".to_string(),
         });
     }
+    if worktree.project_id != task.project_id {
+        return Err(ApplicationError::TaskProjectMismatch {
+            expected_project_id: task.project_id.to_string(),
+            actual_project_id: worktree.project_id.to_string(),
+        });
+    }
 
     Ok((task, worktree))
+}
+
+/// Returns the persisted checkout root required for task-scoped Git operations.
+fn trusted_worktree_root(worktree: &Worktree) -> Result<&Path, ApplicationError> {
+    worktree
+        .root()
+        .ok_or_else(|| ApplicationError::TaskWorktree {
+            message: format!(
+                "worktree {} predates trusted root and branch persistence",
+                worktree.id
+            ),
+        })
 }
 
 /// Loads one visible task so every comment operation shares identical not-found behavior.

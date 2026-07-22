@@ -1,4 +1,4 @@
-use ora_domain::{Task, TaskId};
+use ora_domain::{Task, TaskId, WorktreeId};
 use std::path::PathBuf;
 
 /// Supplies application-owned persistence operations for task CRUD use cases.
@@ -46,6 +46,12 @@ pub trait TaskWorktreeProvisioner {
         request: CreateTaskWorktreeRequest,
     ) -> Result<CreateTaskWorktreeResponse, TaskWorktreeProvisionerError>;
 
+    /// Verifies that a persisted task still owns the exact linked worktree before recovery exposes it.
+    fn verify_task_worktree(
+        &self,
+        request: VerifyTaskWorktreeRequest,
+    ) -> Result<(), TaskWorktreeProvisionerError>;
+
     /// Removes the linked worktree requested by task cleanup flows.
     fn delete_task_worktree(
         &self,
@@ -56,6 +62,7 @@ pub trait TaskWorktreeProvisioner {
 /// Carries the derived Git branch and filesystem path for one new task worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTaskWorktreeRequest {
+    pub worktree_id: WorktreeId,
     pub branch_name: String,
     pub worktree_path: PathBuf,
 }
@@ -64,6 +71,14 @@ pub struct CreateTaskWorktreeRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTaskWorktreeResponse {
     pub base_commit_id: String,
+}
+
+/// Carries the persisted identity that startup recovery must confirm against Git.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyTaskWorktreeRequest {
+    pub expected_worktree_id: WorktreeId,
+    pub worktree_path: PathBuf,
+    pub expected_branch_name: String,
 }
 
 /// Describes how task-owned worktree deletion should behave.
@@ -75,7 +90,9 @@ pub enum TaskWorktreeDeletionMode {
 /// Carries the derived filesystem path for one task worktree cleanup action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteTaskWorktreeRequest {
+    pub expected_worktree_id: WorktreeId,
     pub worktree_path: PathBuf,
+    pub expected_branch_name: String,
     pub mode: TaskWorktreeDeletionMode,
 }
 

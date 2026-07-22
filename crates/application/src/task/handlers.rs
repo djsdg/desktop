@@ -1,7 +1,7 @@
 use crate::task::mapper::map_task;
 use crate::task::ports::{
     CreateTaskWorktreeRequest, DeleteTaskWorktreeRequest, TaskIdGenerator, TaskRepository,
-    TaskWorktreeDeletionMode, TaskWorktreeProvisioner,
+    TaskWorktreeDeletionMode, TaskWorktreeProvisioner, VerifyTaskWorktreeRequest,
 };
 use crate::worktree::{WorktreeIdGenerator, WorktreeRepository};
 use crate::{ApplicationError, Clock};
@@ -11,8 +11,9 @@ use ora_contracts::{
     UpdateTaskResponse,
 };
 use ora_domain::{
-    AuditFields, ProjectId, Task as DomainTask, TaskId, TaskStatus as DomainTaskStatus,
-    Worktree as DomainWorktree, WorktreeActivity as DomainWorktreeActivity, WorktreeId,
+    AuditFields, ManagedWorktreeIdentity, ProjectId, Task as DomainTask, TaskId,
+    TaskStatus as DomainTaskStatus, Worktree as DomainWorktree, WorktreeId,
+    WorktreeLifecycle as DomainWorktreeLifecycle,
 };
 use ora_logging::{ora_error, ora_info};
 use std::fs;
@@ -21,6 +22,23 @@ use std::path::{Path, PathBuf};
 
 const TASK_BRANCH_PREFIX_LEN: usize = 8;
 const MAX_TASK_ID_GENERATION_ATTEMPTS: usize = 3;
+
+/// Binds task creation to one configured repository and its managed worktree directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTaskConfiguration {
+    project_id: ProjectId,
+    work_dir: PathBuf,
+}
+
+impl CreateTaskConfiguration {
+    /// Creates the immutable project/worktree boundary enforced by task creation.
+    pub fn new(project_id: ProjectId, work_dir: PathBuf) -> Self {
+        Self {
+            project_id,
+            work_dir,
+        }
+    }
+}
 
 /// Handles task creation without depending on transport-specific concerns.
 pub struct CreateTaskHandler<
@@ -36,7 +54,7 @@ pub struct CreateTaskHandler<
     task_id_generator: TaskIdGeneratorPort,
     worktree_id_generator: WorktreeIdGeneratorPort,
     worktree_provisioner: WorktreeProvisioner,
-    work_dir: PathBuf,
+    configuration: CreateTaskConfiguration,
     clock: ClockSource,
 }
 
@@ -63,7 +81,7 @@ impl<
         task_id_generator: TaskIdGeneratorPort,
         worktree_id_generator: WorktreeIdGeneratorPort,
         worktree_provisioner: WorktreeProvisioner,
-        work_dir: PathBuf,
+        configuration: CreateTaskConfiguration,
         clock: ClockSource,
     ) -> Self {
         Self {
@@ -72,7 +90,7 @@ impl<
             task_id_generator,
             worktree_id_generator,
             worktree_provisioner,
-            work_dir,
+            configuration,
             clock,
         }
     }
@@ -107,67 +125,109 @@ where
         &self,
         request: CreateTaskRequest,
     ) -> Result<CreateTaskResponse, ApplicationError> {
+        let project_id =
+            require_configured_project(&self.configuration.project_id, request.project_id)?;
         let task_id = self
             .select_available_task_id()
             .inspect_err(|error| log_task_failure("create_task", None, error))?;
         let branch_name = branch_name_for_task(&task_id);
-        let worktree_path = worktree_path_for_task(&self.work_dir, &task_id);
-        let provisioned_worktree = self
-            .worktree_provisioner
-            .create_task_worktree(CreateTaskWorktreeRequest {
-                branch_name: branch_name.clone(),
-                worktree_path: worktree_path.clone(),
-            })
-            .map_err(|error| {
-                let error = ApplicationError::from_task_worktree_provisioner_error(error);
-                log_task_failure("create_task", Some(&task_id), &error);
-                error
-            })?;
-
+        let worktree_path = worktree_path_for_task(&self.configuration.work_dir, &task_id);
         let now = self.clock.now_timestamp_millis();
         let worktree_id = self.worktree_id_generator.generate_worktree_id();
-        let worktree = DomainWorktree::new(
+        let worktree = DomainWorktree::managed(
             worktree_id,
             task_id.clone(),
-            Some(branch_name),
-            ora_domain::WorktreeBaseline::recorded(provisioned_worktree.base_commit_id).map_err(
+            project_id.clone(),
+            ManagedWorktreeIdentity::new(worktree_path.clone(), branch_name.clone()).map_err(
                 |error| ApplicationError::TaskWorktree {
                     message: error.to_string(),
                 },
             )?,
-            DomainWorktreeActivity::Active,
-            AuditFields::new(now, now, false),
+            ora_domain::WorktreeBaseline::unavailable(),
+            DomainWorktreeLifecycle::ProvisioningPending,
+            AuditFields::new(now, now, /*is_deleted*/ false),
         );
-        let worktree = match self.worktree_repository.create_worktree(worktree) {
+        let mut worktree = match self.worktree_repository.create_worktree(worktree) {
             Ok(worktree) => worktree,
             Err(error) => {
-                return Err(self.handle_create_failure_after_provisioning(
-                    "create_task",
+                return Err(ApplicationError::from_worktree_repository_error(error));
+            }
+        };
+        let provisioned_worktree =
+            match self
+                .worktree_provisioner
+                .create_task_worktree(CreateTaskWorktreeRequest {
+                    worktree_id: worktree.id.clone(),
+                    branch_name: branch_name.clone(),
+                    worktree_path: worktree_path.clone(),
+                }) {
+                Ok(provisioned_worktree) => provisioned_worktree,
+                Err(error) => {
+                    return Err(self.rollback_pending_provisioning(
+                        &task_id,
+                        &worktree.id,
+                        &worktree_path,
+                        &branch_name,
+                        ApplicationError::from_task_worktree_provisioner_error(error),
+                    ));
+                }
+            };
+        let baseline =
+            match ora_domain::WorktreeBaseline::recorded(provisioned_worktree.base_commit_id) {
+                Ok(baseline) => baseline,
+                Err(error) => {
+                    return Err(self.rollback_pending_provisioning(
+                        &task_id,
+                        &worktree.id,
+                        &worktree_path,
+                        &branch_name,
+                        ApplicationError::TaskWorktree {
+                            message: error.to_string(),
+                        },
+                    ));
+                }
+            };
+        worktree.record_baseline(baseline, self.clock.now_timestamp_millis());
+        let worktree_id = worktree.id.clone();
+        worktree = match self.worktree_repository.update_worktree(worktree) {
+            Ok(worktree) => worktree,
+            Err(error) => {
+                return Err(self.rollback_pending_provisioning(
                     &task_id,
+                    &worktree_id,
                     &worktree_path,
+                    &branch_name,
                     ApplicationError::from_worktree_repository_error(error),
                 ));
             }
         };
         let task = DomainTask::new(
             task_id.clone(),
-            ProjectId::new(request.project_id),
+            project_id,
             request.title,
             map_contract_task_status(request.status),
             Some(worktree.id.clone()),
-            AuditFields::new(now, now, false),
+            AuditFields::new(now, now, /*is_deleted*/ false),
         );
         let task = match self.task_repository.create_task(task) {
             Ok(task) => task,
             Err(error) => {
-                return Err(self.handle_task_persistence_failure_after_worktree_create(
+                return Err(self.rollback_pending_provisioning(
                     &task_id,
                     &worktree.id,
                     &worktree_path,
+                    &branch_name,
                     ApplicationError::from_task_repository_error(error),
                 ));
             }
         };
+        worktree.set_lifecycle(
+            DomainWorktreeLifecycle::Active,
+            self.clock.now_timestamp_millis(),
+        );
+        self.worktree_repository
+            .update_worktree(worktree)
+            .map_err(ApplicationError::from_worktree_repository_error)?;
 
         log_task_success("create_task", Some(&task.id));
 
@@ -182,7 +242,8 @@ where
             let task_id = self.task_id_generator.generate_task_id();
             let branch_prefix = task_branch_prefix(&task_id);
 
-            if task_branch_prefix_exists_in_work_dir(&self.work_dir, &branch_prefix)? {
+            if task_branch_prefix_exists_in_work_dir(&self.configuration.work_dir, &branch_prefix)?
+            {
                 continue;
             }
 
@@ -203,56 +264,41 @@ where
         })
     }
 
-    /// Attempts compensating worktree cleanup after persistence fails and returns the stable application error.
-    fn handle_create_failure_after_provisioning(
-        &self,
-        operation: &'static str,
-        task_id: &TaskId,
-        worktree_path: &Path,
-        original_error: ApplicationError,
-    ) -> ApplicationError {
-        let cleanup_result =
-            self.worktree_provisioner
-                .delete_task_worktree(DeleteTaskWorktreeRequest {
-                    worktree_path: worktree_path.to_path_buf(),
-                    mode: TaskWorktreeDeletionMode::Force,
-                });
-
-        match cleanup_result {
-            Ok(()) => {
-                log_task_failure(operation, Some(task_id), &original_error);
-                original_error
-            }
-            Err(cleanup_error) => {
-                let cleanup_error =
-                    ApplicationError::from_task_worktree_provisioner_error(cleanup_error);
-                log_task_failure(operation, Some(task_id), &cleanup_error);
-                cleanup_error
-            }
-        }
-    }
-
-    /// Soft-deletes the persisted worktree row, then removes the created checkout, before returning a stable failure.
-    fn handle_task_persistence_failure_after_worktree_create(
+    /// Rolls back a durable provisioning intent after any later creation stage fails normally.
+    fn rollback_pending_provisioning(
         &self,
         task_id: &TaskId,
         worktree_id: &WorktreeId,
         worktree_path: &Path,
+        branch_name: &str,
         original_error: ApplicationError,
     ) -> ApplicationError {
-        let worktree_cleanup = self
+        if let Err(cleanup_error) =
+            self.worktree_provisioner
+                .delete_task_worktree(DeleteTaskWorktreeRequest {
+                    expected_worktree_id: worktree_id.clone(),
+                    worktree_path: worktree_path.to_path_buf(),
+                    expected_branch_name: branch_name.to_string(),
+                    mode: TaskWorktreeDeletionMode::Force,
+                })
+        {
+            // Keep the provisioning row visible so startup recovery can retry failed Git cleanup.
+            let cleanup_error =
+                ApplicationError::from_task_worktree_provisioner_error(cleanup_error);
+            log_task_failure("create_task", Some(task_id), &cleanup_error);
+            return cleanup_error;
+        }
+
+        let result = self
             .worktree_repository
             .soft_delete_worktree(worktree_id, self.clock.now_timestamp_millis())
-            .map_err(ApplicationError::from_worktree_repository_error);
-        let filesystem_cleanup = self.handle_create_failure_after_provisioning(
-            "create_task",
-            task_id,
-            worktree_path,
-            original_error,
-        );
-
-        match worktree_cleanup {
-            Ok(_) => filesystem_cleanup,
+            .map_err(ApplicationError::from_worktree_repository_error)
+            .map(|_| original_error);
+        match result {
+            Ok(error) => {
+                log_task_failure("create_task", Some(task_id), &error);
+                error
+            }
             Err(error) => {
                 log_task_failure("create_task", Some(task_id), &error);
                 error
@@ -345,12 +391,17 @@ where
 /// Handles task updates without depending on transport-specific concerns.
 pub struct UpdateTaskHandler<Repository, ClockSource> {
     repository: Repository,
+    project_id: ProjectId,
     clock: ClockSource,
 }
 
 impl<Repository, ClockSource> UpdateTaskHandler<Repository, ClockSource> {
-    pub fn new(repository: Repository, clock: ClockSource) -> Self {
-        Self { repository, clock }
+    pub fn new(repository: Repository, project_id: ProjectId, clock: ClockSource) -> Self {
+        Self {
+            repository,
+            project_id,
+            clock,
+        }
     }
 }
 
@@ -381,10 +432,18 @@ where
                 return Err(error);
             }
         };
+        let requested_project_id =
+            require_configured_project(&self.project_id, request.project_id)?;
+        if existing_task.project_id != requested_project_id {
+            return Err(ApplicationError::TaskProjectMismatch {
+                expected_project_id: requested_project_id.to_string(),
+                actual_project_id: existing_task.project_id.to_string(),
+            });
+        }
 
         let task = DomainTask::new(
             task_id.clone(),
-            ProjectId::new(request.project_id),
+            requested_project_id,
             request.title,
             map_contract_task_status(request.status),
             existing_task.worktree_id,
@@ -408,6 +467,22 @@ where
     }
 }
 
+/// Rejects requests that would bind the configured Git repository to another project identity.
+fn require_configured_project(
+    configured_project_id: &ProjectId,
+    requested_project_id: String,
+) -> Result<ProjectId, ApplicationError> {
+    let requested_project_id = ProjectId::new(requested_project_id);
+    if requested_project_id != *configured_project_id {
+        return Err(ApplicationError::TaskProjectMismatch {
+            expected_project_id: configured_project_id.to_string(),
+            actual_project_id: requested_project_id.to_string(),
+        });
+    }
+
+    Ok(requested_project_id)
+}
+
 /// Handles task deletion without exposing transport-specific cleanup details.
 pub struct DeleteTaskHandler<
     TaskRepositoryPort,
@@ -418,8 +493,29 @@ pub struct DeleteTaskHandler<
     task_repository: TaskRepositoryPort,
     worktree_repository: WorktreeRepositoryPort,
     worktree_provisioner: WorktreeProvisioner,
-    work_dir: PathBuf,
+    project_id: ProjectId,
     clock: ClockSource,
+}
+
+/// Retries durable worktree removals that were interrupted after entering `RemovalPending`.
+pub struct RecoverPendingTaskWorktreesHandler<
+    TaskRepositoryPort,
+    WorktreeRepositoryPort,
+    WorktreeProvisioner,
+    ClockSource,
+> {
+    task_repository: TaskRepositoryPort,
+    worktree_repository: WorktreeRepositoryPort,
+    worktree_provisioner: WorktreeProvisioner,
+    project_id: ProjectId,
+    clock: ClockSource,
+}
+
+/// Summarizes one best-effort recovery pass without hiding individual failures from logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskWorktreeRecoveryReport {
+    pub recovered: usize,
+    pub failed: usize,
 }
 
 impl<TaskRepositoryPort, WorktreeRepositoryPort, WorktreeProvisioner, ClockSource>
@@ -429,16 +525,106 @@ impl<TaskRepositoryPort, WorktreeRepositoryPort, WorktreeProvisioner, ClockSourc
         task_repository: TaskRepositoryPort,
         worktree_repository: WorktreeRepositoryPort,
         worktree_provisioner: WorktreeProvisioner,
-        work_dir: PathBuf,
+        project_id: ProjectId,
         clock: ClockSource,
     ) -> Self {
         Self {
             task_repository,
             worktree_repository,
             worktree_provisioner,
-            work_dir,
+            project_id,
             clock,
         }
+    }
+}
+
+impl<TaskRepositoryPort, WorktreeRepositoryPort, WorktreeProvisioner, ClockSource>
+    RecoverPendingTaskWorktreesHandler<
+        TaskRepositoryPort,
+        WorktreeRepositoryPort,
+        WorktreeProvisioner,
+        ClockSource,
+    >
+{
+    /// Builds the recovery use case from the same dependencies as normal task deletion.
+    pub fn new(
+        task_repository: TaskRepositoryPort,
+        worktree_repository: WorktreeRepositoryPort,
+        worktree_provisioner: WorktreeProvisioner,
+        project_id: ProjectId,
+        clock: ClockSource,
+    ) -> Self {
+        Self {
+            task_repository,
+            worktree_repository,
+            worktree_provisioner,
+            project_id,
+            clock,
+        }
+    }
+}
+
+impl<TaskRepositoryPort, WorktreeRepositoryPort, WorktreeProvisioner, ClockSource>
+    RecoverPendingTaskWorktreesHandler<
+        TaskRepositoryPort,
+        WorktreeRepositoryPort,
+        WorktreeProvisioner,
+        ClockSource,
+    >
+where
+    TaskRepositoryPort: TaskRepository,
+    WorktreeRepositoryPort: WorktreeRepository,
+    WorktreeProvisioner: TaskWorktreeProvisioner,
+    ClockSource: Clock,
+{
+    /// Reconciles interrupted provisioning and removal states while leaving failures visible.
+    pub fn handle(&self) -> Result<TaskWorktreeRecoveryReport, ApplicationError> {
+        let pending_worktrees = self
+            .worktree_repository
+            .list_worktrees()
+            .map_err(ApplicationError::from_worktree_repository_error)?
+            .into_iter()
+            .filter(|worktree| {
+                worktree.project_id == self.project_id
+                    && worktree.lifecycle() != ora_domain::WorktreeLifecycle::Active
+            });
+        let mut report = TaskWorktreeRecoveryReport {
+            recovered: 0,
+            failed: 0,
+        };
+
+        for worktree in pending_worktrees {
+            let task_id = worktree.task_id.clone();
+            let result = match worktree.lifecycle() {
+                DomainWorktreeLifecycle::ProvisioningPending => recover_pending_provisioning(
+                    &self.task_repository,
+                    &self.worktree_repository,
+                    &self.worktree_provisioner,
+                    &self.clock,
+                    &worktree,
+                ),
+                DomainWorktreeLifecycle::RemovalPending => finalize_pending_worktree_removal(
+                    &self.task_repository,
+                    &self.worktree_repository,
+                    &self.worktree_provisioner,
+                    &self.clock,
+                    &worktree,
+                ),
+                DomainWorktreeLifecycle::Active => Ok(()),
+            };
+            match result {
+                Ok(()) => {
+                    report.recovered += 1;
+                    log_task_success("recover_task_worktree", Some(&task_id));
+                }
+                Err(error) => {
+                    report.failed += 1;
+                    log_task_failure("recover_task_worktree", Some(&task_id), &error);
+                }
+            }
+        }
+
+        Ok(report)
     }
 }
 
@@ -471,6 +657,12 @@ where
                 return Err(error);
             }
         };
+        if existing_task.project_id != self.project_id {
+            return Err(ApplicationError::TaskProjectMismatch {
+                expected_project_id: self.project_id.to_string(),
+                actual_project_id: existing_task.project_id.to_string(),
+            });
+        }
         if let Some(worktree_id) = existing_task.worktree_id {
             let existing_worktree = self
                 .worktree_repository
@@ -480,7 +672,7 @@ where
                     log_task_failure("delete_task", Some(&task_id), &error);
                     error
                 })?;
-            let existing_worktree = match existing_worktree {
+            let mut existing_worktree = match existing_worktree {
                 Some(worktree) => worktree,
                 None => {
                     let error = ApplicationError::WorktreeNotFound {
@@ -490,24 +682,50 @@ where
                     return Err(error);
                 }
             };
-            let worktree_path = worktree_path_for_task(&self.work_dir, &task_id);
-            self.worktree_provisioner
-                .delete_task_worktree(DeleteTaskWorktreeRequest {
-                    worktree_path,
-                    mode: TaskWorktreeDeletionMode::Force,
-                })
-                .map_err(|error| {
-                    let error = ApplicationError::from_task_worktree_provisioner_error(error);
-                    log_task_failure("delete_task", Some(&task_id), &error);
-                    error
-                })?;
-            self.worktree_repository
-                .soft_delete_worktree(&existing_worktree.id, self.clock.now_timestamp_millis())
-                .map_err(|error| {
-                    let error = ApplicationError::from_worktree_repository_error(error);
-                    log_task_failure("delete_task", Some(&task_id), &error);
-                    error
-                })?;
+            if existing_worktree.task_id != existing_task.id {
+                let error = ApplicationError::TaskWorktree {
+                    message: format!(
+                        "worktree {} ownership does not match task {}",
+                        existing_worktree.id, existing_task.id
+                    ),
+                };
+                log_task_failure("delete_task", Some(&task_id), &error);
+                return Err(error);
+            }
+            if existing_worktree.project_id != existing_task.project_id {
+                return Err(ApplicationError::TaskProjectMismatch {
+                    expected_project_id: existing_task.project_id.to_string(),
+                    actual_project_id: existing_worktree.project_id.to_string(),
+                });
+            }
+            managed_worktree_identity(&existing_worktree)?;
+            if existing_worktree.lifecycle() != ora_domain::WorktreeLifecycle::RemovalPending {
+                existing_worktree.set_lifecycle(
+                    DomainWorktreeLifecycle::RemovalPending,
+                    self.clock.now_timestamp_millis(),
+                );
+                existing_worktree = self
+                    .worktree_repository
+                    .update_worktree(existing_worktree)
+                    .map_err(|error| {
+                        let error = ApplicationError::from_worktree_repository_error(error);
+                        log_task_failure("delete_task", Some(&task_id), &error);
+                        error
+                    })?;
+            }
+            finalize_pending_worktree_removal(
+                &self.task_repository,
+                &self.worktree_repository,
+                &self.worktree_provisioner,
+                &self.clock,
+                &existing_worktree,
+            )
+            .inspect_err(|error| log_task_failure("delete_task", Some(&task_id), error))?;
+
+            log_task_success("delete_task", Some(&task_id));
+            return Ok(DeleteTaskResponse {
+                task_id: task_id.to_string(),
+            });
         }
 
         let deleted = self
@@ -532,6 +750,136 @@ where
             log_task_failure("delete_task", Some(&task_id), &error);
             Err(error)
         }
+    }
+}
+
+/// Completes the retry-safe portion of deletion after durable state is `RemovalPending`.
+fn finalize_pending_worktree_removal<
+    TaskRepositoryPort,
+    WorktreeRepositoryPort,
+    WorktreeProvisioner,
+    ClockSource,
+>(
+    task_repository: &TaskRepositoryPort,
+    worktree_repository: &WorktreeRepositoryPort,
+    worktree_provisioner: &WorktreeProvisioner,
+    clock: &ClockSource,
+    worktree: &DomainWorktree,
+) -> Result<(), ApplicationError>
+where
+    TaskRepositoryPort: TaskRepository,
+    WorktreeRepositoryPort: WorktreeRepository,
+    WorktreeProvisioner: TaskWorktreeProvisioner,
+    ClockSource: Clock,
+{
+    let (worktree_path, branch_name) = managed_worktree_identity(worktree)?;
+    worktree_provisioner
+        .delete_task_worktree(DeleteTaskWorktreeRequest {
+            expected_worktree_id: worktree.id.clone(),
+            worktree_path: worktree_path.to_path_buf(),
+            expected_branch_name: branch_name.to_string(),
+            mode: TaskWorktreeDeletionMode::Force,
+        })
+        .map_err(ApplicationError::from_task_worktree_provisioner_error)?;
+
+    let deleted_at = clock.now_timestamp_millis();
+    task_repository
+        .soft_delete_task(&worktree.task_id, deleted_at)
+        .map_err(ApplicationError::from_task_repository_error)?;
+    worktree_repository
+        .soft_delete_worktree(&worktree.id, deleted_at)
+        .map_err(ApplicationError::from_worktree_repository_error)?;
+
+    Ok(())
+}
+
+/// Resolves a pending creation by activating an owned task or cleaning an orphaned checkout.
+fn recover_pending_provisioning<
+    TaskRepositoryPort,
+    WorktreeRepositoryPort,
+    WorktreeProvisioner,
+    ClockSource,
+>(
+    task_repository: &TaskRepositoryPort,
+    worktree_repository: &WorktreeRepositoryPort,
+    worktree_provisioner: &WorktreeProvisioner,
+    clock: &ClockSource,
+    worktree: &DomainWorktree,
+) -> Result<(), ApplicationError>
+where
+    TaskRepositoryPort: TaskRepository,
+    WorktreeRepositoryPort: WorktreeRepository,
+    WorktreeProvisioner: TaskWorktreeProvisioner,
+    ClockSource: Clock,
+{
+    let task = task_repository
+        .find_task(&worktree.task_id)
+        .map_err(ApplicationError::from_task_repository_error)?;
+    if let Some(task) = task {
+        if task.project_id != worktree.project_id
+            || task.worktree_id.as_ref() != Some(&worktree.id)
+            || worktree.baseline.commit_id().is_none()
+        {
+            return Err(ApplicationError::TaskWorktree {
+                message: format!(
+                    "pending worktree {} does not match its persisted task",
+                    worktree.id
+                ),
+            });
+        }
+
+        let (worktree_path, branch_name) = managed_worktree_identity(worktree)?;
+        worktree_provisioner
+            .verify_task_worktree(VerifyTaskWorktreeRequest {
+                expected_worktree_id: worktree.id.clone(),
+                worktree_path: worktree_path.to_path_buf(),
+                expected_branch_name: branch_name.to_string(),
+            })
+            .map_err(ApplicationError::from_task_worktree_provisioner_error)?;
+
+        let mut active_worktree = worktree.clone();
+        active_worktree.set_lifecycle(
+            DomainWorktreeLifecycle::Active,
+            clock.now_timestamp_millis(),
+        );
+        worktree_repository
+            .update_worktree(active_worktree)
+            .map_err(ApplicationError::from_worktree_repository_error)?;
+        return Ok(());
+    }
+
+    let (worktree_path, branch_name) = managed_worktree_identity(worktree)?;
+    worktree_provisioner
+        .delete_task_worktree(DeleteTaskWorktreeRequest {
+            expected_worktree_id: worktree.id.clone(),
+            worktree_path: worktree_path.to_path_buf(),
+            expected_branch_name: branch_name.to_string(),
+            mode: TaskWorktreeDeletionMode::Force,
+        })
+        .map_err(ApplicationError::from_task_worktree_provisioner_error)?;
+    worktree_repository
+        .soft_delete_worktree(&worktree.id, clock.now_timestamp_millis())
+        .map_err(ApplicationError::from_worktree_repository_error)?;
+
+    Ok(())
+}
+
+/// Returns the persisted identity required before any filesystem mutation is allowed.
+fn managed_worktree_identity(worktree: &DomainWorktree) -> Result<(&Path, &str), ApplicationError> {
+    match (worktree.root(), worktree.branch_name()) {
+        (Some(root), Some(branch_name)) => Ok((root, branch_name)),
+        (None, None) => Err(ApplicationError::TaskWorktree {
+            message: format!(
+                "worktree {} predates trusted root and branch persistence",
+                worktree.id
+            ),
+        }),
+        (Some(_), None) | (None, Some(_)) => Err(ApplicationError::TaskWorktree {
+            message: format!(
+                "worktree {} has an incomplete trusted identity",
+                worktree.id
+            ),
+        }),
     }
 }
 

@@ -2,10 +2,36 @@ use ora_contracts::{TaskDiffCommentAnchor, TaskDiffSide};
 
 /// Verifies that a client-provided anchor identifies real lines in one generated patch.
 pub(super) fn anchor_exists(patch: &str, anchor: &TaskDiffCommentAnchor) -> bool {
-    patch
-        .split("diff --git ")
-        .skip(1)
+    file_sections(patch)
+        .into_iter()
         .any(|section| section_contains_anchor(section, anchor))
+}
+
+/// Yields file sections only at real line-start patch headers so source text cannot split them.
+fn file_sections(patch: &str) -> Vec<&str> {
+    const HEADER: &str = "diff --git ";
+    let mut starts = Vec::new();
+    if patch.starts_with(HEADER) {
+        starts.push(0);
+    }
+    starts.extend(
+        patch
+            .match_indices("\ndiff --git ")
+            .map(|(offset, _)| offset + 1),
+    );
+
+    starts
+        .iter()
+        .copied()
+        .zip(
+            starts
+                .iter()
+                .copied()
+                .skip(1)
+                .chain(std::iter::once(patch.len())),
+        )
+        .map(move |(start, end)| &patch[start + HEADER.len()..end])
+        .collect()
 }
 
 /// Restricts hunk and line matching to the file named by the anchor.
@@ -169,5 +195,39 @@ mod tests {
             decode_quoted_path("\"a/\\a\\b\\t\\n\\v\\f\\r\\\\\\\"\""),
             Some("a/\x07\x08\t\n\x0b\x0c\r\\\"".to_string())
         );
+    }
+
+    /// Verifies source lines containing a patch-header phrase do not hide later valid anchors.
+    #[test]
+    fn ignores_diff_header_phrases_inside_hunk_content() {
+        let patch = "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -0,0 +1,2 @@\n+diff --git a/fake b/fake\n+after marker\n";
+        let anchor = TaskDiffCommentAnchor {
+            diff_id: "diff".to_string(),
+            path: "src/main.rs".to_string(),
+            side: TaskDiffSide::New,
+            start_line: 2,
+            end_line: 2,
+            hunk_header: "@@ -0,0 +1,2 @@".to_string(),
+            line_content: "after marker".to_string(),
+        };
+
+        assert_eq!(anchor_exists(patch, &anchor), true);
+    }
+
+    /// Verifies a filename containing the header phrase remains one parseable file section.
+    #[test]
+    fn ignores_diff_header_phrases_inside_file_names() {
+        let patch = "diff --git a/diff --git note.txt b/diff --git note.txt\n--- a/diff --git note.txt\n+++ b/diff --git note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let anchor = TaskDiffCommentAnchor {
+            diff_id: "diff".to_string(),
+            path: "diff --git note.txt".to_string(),
+            side: TaskDiffSide::New,
+            start_line: 1,
+            end_line: 1,
+            hunk_header: "@@ -1 +1 @@".to_string(),
+            line_content: "new".to_string(),
+        };
+
+        assert_eq!(anchor_exists(patch, &anchor), true);
     }
 }

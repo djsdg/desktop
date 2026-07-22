@@ -1,7 +1,7 @@
 use gitlancer::parse::commit::{parse_commit_id, parse_commit_response};
 use gitlancer::parse::status::parse_status_v2;
 use gitlancer::parse::worktree::parse_worktree_list;
-use gitlancer::{RepoRoot, WorktreeKind};
+use pretty_assertions::assert_eq;
 
 /// Verifies commit metadata parsing returns the commit ID and summary from the readback payload.
 #[test]
@@ -35,60 +35,93 @@ fn parse_commit_id_reads_first_non_empty_line() {
     );
 }
 
-/// Verifies porcelain v2 status parsing preserves each NUL-delimited status record.
+/// Verifies porcelain v2 status parsing returns typed records with repository-relative paths.
 #[test]
-fn parse_status_v2_splits_nul_delimited_records() {
-    let entries = parse_status_v2(
-        "? untracked.txt\0 1 M. N... 100644 100644 100644 abcdef abcdef tracked.txt\0",
-    )
+fn parse_status_v2_returns_typed_records() {
+    let object_id = "0123456789abcdef0123456789abcdef01234567";
+    let entries = parse_status_v2(&format!(
+        "? untracked.txt\0# branch.head main\01 M. N... 100644 100644 100644 {object_id} {object_id} tracked file.txt\0"
+    ))
     .expect("parse status");
 
     assert_eq!(entries.len(), 2, "two status records should be returned");
-    assert_eq!(
-        entries[0].raw, "? untracked.txt",
-        "the first raw entry should match the first record"
-    );
     assert!(
-        entries[1].raw.contains("tracked.txt"),
-        "the second raw entry should preserve the tracked file name"
-    );
-}
-
-/// Verifies worktree parsing stamps every record with the owning repository and linked-worktree kind.
-#[test]
-fn parse_worktree_list_marks_main_and_linked_worktrees() {
-    let repo_root = RepoRoot::new("/tmp/repo");
-    let output = "\
-worktree /tmp/repo
-HEAD 0123456789abcdef0123456789abcdef01234567
-branch refs/heads/main
-
-worktree /tmp/worktrees/feature-tree
-HEAD 89abcdef0123456789abcdef0123456789abcdef
-branch refs/heads/feature/runtime
-";
-
-    let worktrees = parse_worktree_list(&repo_root, output).expect("parse worktrees");
-
-    assert_eq!(
-        worktrees.len(),
-        2,
-        "main and linked worktrees should be returned"
-    );
-    assert!(
-        matches!(worktrees[0].kind(), WorktreeKind::Main),
-        "the repository checkout should be classified as the main worktree"
+        matches!(
+            entries[0],
+            gitlancer::git::status::StatusEntry::Untracked { .. }
+        ),
+        "the untracked record should retain its semantic kind"
     );
     assert!(
         matches!(
-            worktrees[1].kind(),
-            WorktreeKind::Linked { name } if name == "feature-tree"
+            entries[1],
+            gitlancer::git::status::StatusEntry::Ordinary { .. }
         ),
-        "linked worktrees should derive a stable name from the checkout path"
+        "the tracked record should retain its semantic kind"
     );
     assert_eq!(
-        worktrees[1].repo_root().as_path(),
-        repo_root.as_path(),
-        "linked worktrees should retain the owning repository root"
+        entries[1].path().as_path(),
+        std::path::Path::new("tracked file.txt")
+    );
+}
+
+/// Verifies worktree parsing preserves machine-readable identity and state fields.
+#[test]
+fn parse_worktree_list_preserves_nul_delimited_records() {
+    let output = concat!(
+        "worktree /tmp/repo\0",
+        "HEAD 0123456789abcdef0123456789abcdef01234567\0",
+        "branch refs/heads/main\0\0",
+        "worktree /tmp/worktrees/feature\n tree\0",
+        "HEAD 89abcdef0123456789abcdef0123456789abcdef\0",
+        "detached\0",
+        "locked maintenance\0\0",
+    );
+
+    let worktrees = parse_worktree_list(output).expect("parse worktrees");
+
+    assert_eq!(
+        worktrees,
+        vec![
+            gitlancer::parse::worktree::ParsedWorktree::Checkout {
+                worktree_root: gitlancer::WorktreeRoot::new("/tmp/repo"),
+                head_commit_id: gitlancer::CommitId::new(
+                    "0123456789abcdef0123456789abcdef01234567"
+                )
+                .expect("test commit id should be valid"),
+                branch: Some(
+                    gitlancer::BranchName::new("main").expect("test branch should be valid"),
+                ),
+                detached: false,
+                locked_reason: None,
+                prunable_reason: None,
+            },
+            gitlancer::parse::worktree::ParsedWorktree::Checkout {
+                worktree_root: gitlancer::WorktreeRoot::new("/tmp/worktrees/feature\n tree"),
+                head_commit_id: gitlancer::CommitId::new(
+                    "89abcdef0123456789abcdef0123456789abcdef"
+                )
+                .expect("test commit id should be valid"),
+                branch: None,
+                detached: true,
+                locked_reason: Some("maintenance".to_string()),
+                prunable_reason: None,
+            },
+        ]
+    );
+}
+
+/// Verifies a bare repository record remains usable even though Git omits checkout-only HEAD state.
+#[test]
+fn parse_worktree_list_preserves_bare_repository_roots() {
+    let output = "worktree /tmp/repo.git\0bare\0\0";
+
+    let worktrees = parse_worktree_list(output).expect("parse bare repository");
+
+    assert_eq!(
+        worktrees,
+        vec![gitlancer::parse::worktree::ParsedWorktree::Bare {
+            repository_root: gitlancer::RepoRoot::new("/tmp/repo.git"),
+        }]
     );
 }

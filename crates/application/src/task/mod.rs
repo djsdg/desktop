@@ -8,12 +8,14 @@ mod worktree_provisioner;
 mod tests;
 
 pub use handlers::{
-    CreateTaskHandler, DeleteTaskHandler, GetTaskHandler, ListTasksHandler, UpdateTaskHandler,
+    CreateTaskConfiguration, CreateTaskHandler, DeleteTaskHandler, GetTaskHandler,
+    ListTasksHandler, RecoverPendingTaskWorktreesHandler, TaskWorktreeRecoveryReport,
+    UpdateTaskHandler,
 };
 pub use id_generator::UuidTaskIdGenerator;
 pub use ports::{
     CreateTaskWorktreeRequest, CreateTaskWorktreeResponse, DeleteTaskWorktreeRequest,
     TaskIdGenerator, TaskRepository, TaskRepositoryError, TaskWorktreeDeletionMode,
-    TaskWorktreeProvisioner, TaskWorktreeProvisionerError,
+    TaskWorktreeProvisioner, TaskWorktreeProvisionerError, VerifyTaskWorktreeRequest,
 };
 pub use worktree_provisioner::GitTaskWorktreeProvisioner;

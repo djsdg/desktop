@@ -30,10 +30,7 @@ impl<R: GitRunner> Git<R> {
     /// Computes tracked and untracked changes without staging files or invoking clean filters.
     pub fn diff(&self, request: DiffRequest<'_>) -> Result<DiffResponse, GitlancerError> {
         let head_output = self.runner().run(&build_head_command(request.worktree))?;
-        let head_commit_id = head_output.stdout.trim();
-        if head_commit_id.is_empty() {
-            return Err(crate::ParseError::MissingLine.into());
-        }
+        let head_commit_id = crate::parse::commit::parse_commit_id(&head_output.stdout)?;
 
         let tracked = self
             .runner()
@@ -45,6 +42,7 @@ impl<R: GitRunner> Git<R> {
             .map_err(map_bounded_diff_error)?
             .stdout;
         let mut patch = tracked;
+        ensure_diff_size(&patch)?;
         let untracked_output = self
             .runner()
             .run_bounded(
@@ -76,10 +74,21 @@ impl<R: GitRunner> Git<R> {
                 untracked_patch
             };
             append_patch(&mut patch, &untracked_patch);
+            ensure_diff_size(&patch)?;
+        }
+
+        let verified_head_output = self.runner().run(&build_head_command(request.worktree))?;
+        let verified_head_commit_id =
+            crate::parse::commit::parse_commit_id(&verified_head_output.stdout)?;
+        if head_commit_id != verified_head_commit_id {
+            return Err(GitlancerError::DiffHeadChanged {
+                before_commit_id: head_commit_id.as_str().to_string(),
+                after_commit_id: verified_head_commit_id.as_str().to_string(),
+            });
         }
 
         Ok(DiffResponse {
-            head_commit_id: CommitId::new(head_commit_id),
+            head_commit_id,
             patch,
         })
     }
@@ -188,6 +197,18 @@ fn diff_too_large() -> GitlancerError {
     }
 }
 
+/// Enforces the response budget again after UTF-8 normalization and patch composition.
+fn ensure_diff_size(patch: &str) -> Result<(), GitlancerError> {
+    if patch.len() > MAX_DIFF_BYTES {
+        return Err(GitlancerError::DiffTooLarge {
+            byte_count: patch.len(),
+            max_byte_count: MAX_DIFF_BYTES,
+        });
+    }
+
+    Ok(())
+}
+
 /// Adds a file patch while preserving exactly one separator between patch streams.
 fn append_patch(patch: &mut String, addition: &str) {
     if addition.is_empty() {
@@ -214,6 +235,9 @@ pub fn build_diff_command(request: &DiffRequest<'_>) -> GitCommand {
             "--no-ext-diff",
             "--no-textconv",
             "--find-renames",
+            "--default-prefix",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
             "--unified=3",
             request.base_commit_id.as_str(),
             "--",
@@ -238,11 +262,15 @@ fn build_untracked_diff_command(
     GitCommand::new(
         worktree.worktree_root().as_path().to_path_buf(),
         vec![
+            "--literal-pathspecs",
             "diff",
             "--no-index",
             "--no-color",
             "--no-ext-diff",
             "--no-textconv",
+            "--default-prefix",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
             "--unified=3",
             "--",
             "/dev/null",
@@ -277,7 +305,7 @@ fn build_intent_to_add_command(
 ) -> GitCommand {
     command_with_index(
         worktree,
-        vec!["add", "--intent-to-add", "--", path],
+        vec!["--literal-pathspecs", "add", "--intent-to-add", "--", path],
         temporary_index,
         GitIntent::Mutating,
     )
@@ -292,10 +320,14 @@ fn build_empty_untracked_diff_command(
     command_with_index(
         worktree,
         vec![
+            "--literal-pathspecs",
             "diff",
             "--no-color",
             "--no-ext-diff",
             "--no-textconv",
+            "--default-prefix",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
             "--unified=3",
             "--",
             path,
@@ -335,19 +367,61 @@ fn command(worktree: &WorktreeHandle, args: Vec<&str>) -> GitCommand {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
     use super::{
         DiffRequest, build_diff_command, build_empty_untracked_diff_command,
         build_initialize_temporary_index_command, build_intent_to_add_command,
-        build_untracked_diff_command,
+        build_untracked_diff_command, ensure_diff_size,
     };
-    use crate::{CommitId, GitDir, RepoRoot, WorktreeHandle, WorktreeKind, WorktreeRoot};
+    use crate::{
+        CommitId, Git, GitCommand, GitDir, GitExecError, GitOutput, GitRunner, GitlancerError,
+        RepoRoot, WorktreeHandle, WorktreeKind, WorktreeRoot,
+    };
     use pretty_assertions::assert_eq;
+
+    const BASE_COMMIT_ID: &str = "0123456789abcdef0123456789abcdef01234567";
+    const CHANGED_COMMIT_ID: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+    /// Verifies the public patch budget applies to the final UTF-8 string, not only captured bytes.
+    #[test]
+    fn rejects_final_patch_that_exceeds_response_budget() {
+        let oversized_patch = "x".repeat(super::MAX_DIFF_BYTES + 1);
+
+        assert!(matches!(
+            ensure_diff_size(&oversized_patch),
+            Err(GitlancerError::DiffTooLarge {
+                byte_count,
+                max_byte_count,
+            }) if byte_count == super::MAX_DIFF_BYTES + 1
+                && max_byte_count == super::MAX_DIFF_BYTES
+        ));
+    }
+
+    /// Returns scripted outputs in command order so multi-command diff behavior stays deterministic.
+    struct ScriptedRunner {
+        outputs: RefCell<VecDeque<GitOutput>>,
+    }
+
+    impl GitRunner for ScriptedRunner {
+        /// Supplies one prepared output for each Git command issued by the use case.
+        fn run(&self, _command: &GitCommand) -> Result<GitOutput, GitExecError> {
+            self.outputs
+                .borrow_mut()
+                .pop_front()
+                .ok_or_else(|| GitExecError::OutputReadFailed {
+                    stream: "scripted output",
+                    source: std::io::Error::other("missing scripted Git output"),
+                })
+        }
+    }
 
     /// Verifies tracked diffs disable executable filters and emit parser-friendly binary markers.
     #[test]
     fn builds_task_diff_command() {
         let worktree = test_worktree();
-        let base_commit_id = CommitId::new("base-commit");
+        let base_commit_id = CommitId::new(BASE_COMMIT_ID).expect("test commit id should be valid");
         let command = build_diff_command(&DiffRequest {
             worktree: &worktree,
             base_commit_id: &base_commit_id,
@@ -361,8 +435,11 @@ mod tests {
                 "--no-ext-diff",
                 "--no-textconv",
                 "--find-renames",
+                "--default-prefix",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
                 "--unified=3",
-                "base-commit",
+                BASE_COMMIT_ID,
                 "--",
             ]
         );
@@ -381,11 +458,15 @@ mod tests {
             )
             .args,
             vec![
+                "--literal-pathspecs",
                 "diff",
                 "--no-index",
                 "--no-color",
                 "--no-ext-diff",
                 "--no-textconv",
+                "--default-prefix",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
                 "--unified=3",
                 "--",
                 "/dev/null",
@@ -419,6 +500,7 @@ mod tests {
                 ),
                 (
                     vec![
+                        "--literal-pathspecs".to_string(),
                         "add".to_string(),
                         "--intent-to-add".to_string(),
                         "--".to_string(),
@@ -432,10 +514,14 @@ mod tests {
                 ),
                 (
                     vec![
+                        "--literal-pathspecs".to_string(),
                         "diff".to_string(),
                         "--no-color".to_string(),
                         "--no-ext-diff".to_string(),
                         "--no-textconv".to_string(),
+                        "--default-prefix".to_string(),
+                        "--src-prefix=a/".to_string(),
+                        "--dst-prefix=b/".to_string(),
                         "--unified=3".to_string(),
                         "--".to_string(),
                         "empty.txt".to_string(),
@@ -450,15 +536,48 @@ mod tests {
         );
     }
 
+    /// Rejects a patch whose HEAD changed while its tracked and untracked sections were generated.
+    #[test]
+    fn rejects_diff_when_head_changes_during_snapshot() {
+        let worktree = test_worktree();
+        let base_commit_id = CommitId::new(BASE_COMMIT_ID).expect("test commit id should be valid");
+        let git = Git::new(ScriptedRunner {
+            outputs: RefCell::new(VecDeque::from(vec![
+                GitOutput::new(Some(0), format!("{BASE_COMMIT_ID}\n"), String::new(), 0),
+                GitOutput::new(Some(0), "tracked patch\n".to_string(), String::new(), 0),
+                GitOutput::new(Some(0), String::new(), String::new(), 0),
+                GitOutput::new(Some(0), format!("{CHANGED_COMMIT_ID}\n"), String::new(), 0),
+            ])),
+        });
+
+        let error = git
+            .diff(DiffRequest {
+                worktree: &worktree,
+                base_commit_id: &base_commit_id,
+            })
+            .expect_err("a moving HEAD must not produce a mixed diff snapshot");
+
+        assert!(matches!(
+            error,
+            GitlancerError::DiffHeadChanged {
+                before_commit_id,
+                after_commit_id,
+            } if before_commit_id == BASE_COMMIT_ID && after_commit_id == CHANGED_COMMIT_ID
+        ));
+    }
+
     /// Builds a linked worktree fixture without touching the filesystem.
     fn test_worktree() -> WorktreeHandle {
-        WorktreeHandle::new(
+        WorktreeHandle::discovered(
             RepoRoot::new("/repo"),
             WorktreeRoot::new("/repo/worktrees/task"),
             GitDir::new("/repo/.git/worktrees/task"),
             WorktreeKind::Linked {
                 name: "task".to_string(),
             },
+            CommitId::new(BASE_COMMIT_ID).expect("test commit id should be valid"),
+            Some(crate::BranchName::new("ora/task").expect("test branch should be valid")),
+            None,
         )
     }
 }

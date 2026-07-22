@@ -1,5 +1,5 @@
 use crate::domain::paths::WorktreeRoot;
-use crate::domain::refs::{BranchName, CommitId};
+use crate::domain::refs::{BranchName, CommitId, WorktreeIdentityToken};
 use crate::domain::repo::Repository;
 use crate::domain::worktree::{WorktreeHandle, WorktreeKind};
 use crate::error::{DomainError, GitlancerError};
@@ -7,6 +7,10 @@ use crate::exec::command::{GitCommand, GitIntent};
 use crate::exec::env::GitEnv;
 use crate::exec::runner::GitRunner;
 use crate::git::Git;
+use std::io::{Read, Write};
+
+const WORKTREE_IDENTITY_MARKER: &str = "ora-worktree-identity";
+const MAX_WORKTREE_IDENTITY_TOKEN_BYTES: u64 = 128;
 
 /// Carries the information needed to select one worktree from a repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +24,13 @@ pub struct ResolveWorktreeRequest<'a> {
 pub struct FindWorktreeRequest<'a> {
     pub repository: &'a Repository,
     pub candidate_path: &'a std::path::Path,
+}
+
+/// Carries the information needed to discover a worktree whose checkout root exactly matches a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindWorktreeRootRequest<'a> {
+    pub repository: &'a Repository,
+    pub worktree_root: &'a std::path::Path,
 }
 
 /// Returns the complete list of worktrees associated with one repository.
@@ -40,6 +51,7 @@ pub struct CreateWorktreeRequest<'a> {
     pub repository: &'a Repository,
     pub worktree_root: WorktreeRoot,
     pub branch_name: BranchName,
+    pub identity_token: WorktreeIdentityToken,
 }
 
 /// Returns the linked worktree created by the runtime API.
@@ -68,6 +80,20 @@ pub struct DeleteWorktreeRequest<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteWorktreeResponse {
     pub worktree_root: WorktreeRoot,
+    pub outcome: WorktreeDeletionOutcome,
+}
+
+/// Carries the repository whose stale worktree administration records should be pruned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneWorktreesRequest<'a> {
+    pub repository: &'a Repository,
+}
+
+/// Reports whether deletion removed a checkout or found the requested identity already absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeDeletionOutcome {
+    Removed,
+    AlreadyAbsent,
 }
 
 impl From<ListWorktreesResult> for ListWorktreesResponse {
@@ -80,7 +106,7 @@ impl From<ListWorktreesResult> for ListWorktreesResponse {
 }
 
 impl<R: GitRunner> Git<R> {
-    /// Resolves one named worktree by scanning the repository's known worktrees and matching their stable names.
+    /// Resolves one named linked worktree without assigning a conflicting synthetic name to the main checkout.
     pub fn resolve_worktree(
         &self,
         request: ResolveWorktreeRequest<'_>,
@@ -93,7 +119,12 @@ impl<R: GitRunner> Git<R> {
 
         worktrees
             .into_iter()
-            .find(|worktree| worktree_name(worktree) == request.worktree_name)
+            .find(|worktree| {
+                matches!(
+                    worktree.kind(),
+                    WorktreeKind::Linked { name } if name == request.worktree_name
+                )
+            })
             .ok_or_else(|| {
                 GitlancerError::Domain(DomainError::NotAWorktree(
                     request.repository.root().as_path().to_path_buf(),
@@ -128,6 +159,26 @@ impl<R: GitRunner> Git<R> {
             .ok_or(GitlancerError::Domain(DomainError::NotAWorktree(candidate)))
     }
 
+    /// Finds a worktree only when the supplied path is its exact checkout root.
+    pub fn find_worktree_root(
+        &self,
+        request: FindWorktreeRootRequest<'_>,
+    ) -> Result<WorktreeHandle, GitlancerError> {
+        let requested_root = normalize_path_for_worktree_match(request.worktree_root);
+
+        self.list_worktrees(crate::git::repository::ListWorktreesRequest {
+            repository: request.repository,
+        })?
+        .worktrees
+        .into_iter()
+        .find(|worktree| {
+            normalize_path_for_worktree_match(worktree.worktree_root().as_path()) == requested_root
+        })
+        .ok_or(GitlancerError::Domain(DomainError::NotAWorktree(
+            requested_root,
+        )))
+    }
+
     /// Creates one linked worktree and returns the resulting typed worktree handle.
     pub fn create_worktree(
         &self,
@@ -138,14 +189,21 @@ impl<R: GitRunner> Git<R> {
         if head_commit_id.is_empty() {
             return Err(crate::ParseError::MissingLine.into());
         }
-        let head_commit_id = CommitId::new(head_commit_id);
+        let head_commit_id = CommitId::new(head_commit_id)?;
         let command = build_create_worktree_command(&request, &head_commit_id);
         let _output = self.runner().run(&command)?;
-        let worktree = match self.find_worktree(FindWorktreeRequest {
+        let worktree = match self.find_worktree_root(FindWorktreeRootRequest {
             repository: request.repository,
-            candidate_path: request.worktree_root.as_path(),
+            worktree_root: request.worktree_root.as_path(),
         }) {
             Ok(worktree) => worktree,
+            Err(error) => {
+                self.cleanup_failed_worktree_creation(&request)?;
+                return Err(error);
+            }
+        };
+        let worktree = match write_worktree_identity(&worktree, &request.identity_token) {
+            Ok(()) => worktree.with_identity_token(request.identity_token.clone()),
             Err(error) => {
                 self.cleanup_failed_worktree_creation(&request)?;
                 return Err(error);
@@ -177,7 +235,7 @@ impl<R: GitRunner> Git<R> {
         Ok(())
     }
 
-    /// Deletes one linked worktree after validating repository ownership and rejecting the main checkout explicitly.
+    /// Deletes one trusted linked-worktree identity and treats a previously removed identity as success.
     pub fn delete_worktree(
         &self,
         request: DeleteWorktreeRequest<'_>,
@@ -195,22 +253,157 @@ impl<R: GitRunner> Git<R> {
                 ),
             ));
         }
+        if request.worktree.identity_token().is_none() {
+            return Err(GitlancerError::Domain(
+                DomainError::UnmanagedWorktreeDeletionUnsupported(
+                    request.worktree.worktree_root().as_path().to_path_buf(),
+                ),
+            ));
+        }
 
-        let command = build_delete_worktree_command(&request);
+        let current_worktree = self
+            .list_worktrees(crate::git::repository::ListWorktreesRequest {
+                repository: request.repository,
+            })?
+            .worktrees
+            .into_iter()
+            .find(|worktree| {
+                normalize_path_for_worktree_match(worktree.worktree_root().as_path())
+                    == normalize_path_for_worktree_match(request.worktree.worktree_root().as_path())
+            });
+        let Some(current_worktree) = current_worktree else {
+            return Ok(DeleteWorktreeResponse {
+                worktree_root: request.worktree.worktree_root().clone(),
+                outcome: WorktreeDeletionOutcome::AlreadyAbsent,
+            });
+        };
+        if current_worktree.git_dir() != request.worktree.git_dir()
+            || current_worktree.branch() != request.worktree.branch()
+            || current_worktree.identity_token() != request.worktree.identity_token()
+        {
+            return Err(GitlancerError::Domain(
+                DomainError::WorktreeIdentityChanged {
+                    worktree: Box::new(current_worktree.worktree_root().as_path().to_path_buf()),
+                    expected_git_dir: Box::new(request.worktree.git_dir().as_path().to_path_buf()),
+                    actual_git_dir: Box::new(current_worktree.git_dir().as_path().to_path_buf()),
+                    expected_branch: request
+                        .worktree
+                        .branch()
+                        .map(|branch| branch.as_str().to_string()),
+                    actual_branch: current_worktree
+                        .branch()
+                        .map(|branch| branch.as_str().to_string()),
+                    expected_identity_token: request
+                        .worktree
+                        .identity_token()
+                        .map(|token| Box::<str>::from(token.as_str())),
+                    actual_identity_token: current_worktree
+                        .identity_token()
+                        .map(|token| Box::<str>::from(token.as_str())),
+                },
+            ));
+        }
+        if matches!(current_worktree.kind(), WorktreeKind::Main) {
+            return Err(GitlancerError::Domain(
+                DomainError::MainWorktreeDeletionUnsupported(
+                    request.repository.root().as_path().to_path_buf(),
+                ),
+            ));
+        }
+
+        let command = build_delete_worktree_command_for_handle(
+            request.repository,
+            &current_worktree,
+            request.mode,
+        );
         let _output = self.runner().run(&command)?;
 
         Ok(DeleteWorktreeResponse {
             worktree_root: request.worktree.worktree_root().clone(),
+            outcome: WorktreeDeletionOutcome::Removed,
         })
+    }
+
+    /// Removes Git administration records for worktrees whose checkout paths no longer exist.
+    pub fn prune_worktrees(
+        &self,
+        request: PruneWorktreesRequest<'_>,
+    ) -> Result<(), GitlancerError> {
+        let command = GitCommand::new(
+            request.repository.root().as_path().to_path_buf(),
+            vec![
+                "worktree".to_string(),
+                "prune".to_string(),
+                "--expire=now".to_string(),
+            ],
+            GitEnv::default(),
+            GitIntent::Mutating,
+        );
+        self.runner().run(&command)?;
+        Ok(())
     }
 }
 
-/// Derives the stable name callers use to address one worktree.
-fn worktree_name(worktree: &WorktreeHandle) -> &str {
-    match worktree.kind() {
-        crate::domain::worktree::WorktreeKind::Main => "main",
-        crate::domain::worktree::WorktreeKind::Linked { name } => name.as_str(),
+/// Reads the bounded Ora marker stored inside a linked worktree's private Git directory.
+pub(crate) fn read_worktree_identity(
+    git_dir: &std::path::Path,
+) -> Result<Option<WorktreeIdentityToken>, GitlancerError> {
+    let marker_path = git_dir.join(WORKTREE_IDENTITY_MARKER);
+    let file = match std::fs::File::open(&marker_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(GitlancerError::WorktreeIdentityIo {
+                path: marker_path,
+                source,
+            });
+        }
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_WORKTREE_IDENTITY_TOKEN_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| GitlancerError::WorktreeIdentityIo {
+            path: marker_path.clone(),
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_WORKTREE_IDENTITY_TOKEN_BYTES {
+        return Err(DomainError::InvalidWorktreeIdentityToken(
+            "<marker exceeds 128 bytes>".to_string(),
+        )
+        .into());
     }
+    let token = String::from_utf8(bytes).map_err(|error| {
+        DomainError::InvalidWorktreeIdentityToken(
+            String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        )
+    })?;
+
+    WorktreeIdentityToken::new(token)
+        .map(Some)
+        .map_err(Into::into)
+}
+
+/// Persists the unique Ora marker before a created worktree is exposed to upper layers.
+fn write_worktree_identity(
+    worktree: &WorktreeHandle,
+    identity_token: &WorktreeIdentityToken,
+) -> Result<(), GitlancerError> {
+    let marker_path = worktree.git_dir().as_path().join(WORKTREE_IDENTITY_MARKER);
+    let mut marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path)
+        .map_err(|source| GitlancerError::WorktreeIdentityIo {
+            path: marker_path.clone(),
+            source,
+        })?;
+    marker
+        .write_all(identity_token.as_str().as_bytes())
+        .and_then(|()| marker.sync_all())
+        .map_err(|source| GitlancerError::WorktreeIdentityIo {
+            path: marker_path,
+            source,
+        })
 }
 
 /// Normalizes a candidate path lexically so worktree comparisons do not depend on filesystem canonicalization.
@@ -326,22 +519,30 @@ fn build_failed_create_branch_cleanup_command(request: &CreateWorktreeRequest<'_
 
 /// Builds a stable `git worktree remove` command so deletion mode remains visible in one place.
 pub fn build_delete_worktree_command(request: &DeleteWorktreeRequest<'_>) -> GitCommand {
+    build_delete_worktree_command_for_handle(request.repository, request.worktree, request.mode)
+}
+
+/// Builds deletion from the freshly rediscovered identity used immediately before mutation.
+fn build_delete_worktree_command_for_handle(
+    repository: &Repository,
+    worktree: &WorktreeHandle,
+    mode: WorktreeDeletionMode,
+) -> GitCommand {
     let mut args = vec![
         "worktree".to_string(),
         "remove".to_string(),
-        request
-            .worktree
+        worktree
             .worktree_root()
             .as_path()
             .to_string_lossy()
             .into_owned(),
     ];
-    if matches!(request.mode, WorktreeDeletionMode::Force) {
+    if matches!(mode, WorktreeDeletionMode::Force) {
         args.push("--force".to_string());
     }
 
     GitCommand::new(
-        request.repository.root().as_path().to_path_buf(),
+        repository.root().as_path().to_path_buf(),
         args,
         GitEnv::default(),
         GitIntent::Mutating,
@@ -350,14 +551,29 @@ pub fn build_delete_worktree_command(request: &DeleteWorktreeRequest<'_>) -> Git
 
 #[cfg(test)]
 mod tests {
-    use super::{CreateWorktreeRequest, Git, Repository};
+    use super::{
+        CreateWorktreeRequest, DeleteWorktreeRequest, Git, Repository, WorktreeDeletionMode,
+    };
     use crate::{
-        BranchName, GitCommand, GitExecError, GitOutput, GitRunner, GitlancerError, RepoRoot,
+        BranchName, CommitId, GitCommand, GitDir, GitExecError, GitOutput, GitRunner,
+        GitlancerError, RepoRoot, WorktreeHandle, WorktreeIdentityToken, WorktreeKind,
         WorktreeRoot,
     };
     use pretty_assertions::assert_eq;
     use std::cell::RefCell;
     use std::collections::VecDeque;
+
+    const BASE_COMMIT_ID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// Creates a validated branch fixture for worktree lifecycle requests.
+    fn branch_name(value: &str) -> BranchName {
+        BranchName::new(value).expect("test branch should be valid")
+    }
+
+    /// Creates a validated identity fixture for managed worktree lifecycle requests.
+    fn identity_token(value: &str) -> WorktreeIdentityToken {
+        WorktreeIdentityToken::new(value).expect("test identity token should be valid")
+    }
 
     /// Supplies a deterministic command sequence so post-mutation rollback can be tested in isolation.
     struct SequencedRunner {
@@ -401,7 +617,8 @@ mod tests {
         let result = git.create_worktree(CreateWorktreeRequest {
             repository: &repository,
             worktree_root: WorktreeRoot::new("/worktrees/task"),
-            branch_name: BranchName::new("ora/task"),
+            branch_name: branch_name("ora/task"),
+            identity_token: identity_token("worktree-task"),
         });
 
         assert!(result.is_err());
@@ -420,7 +637,7 @@ mod tests {
     #[test]
     fn cleans_up_worktree_and_branch_when_creation_discovery_fails() {
         let runner = SequencedRunner::new(vec![
-            Ok(successful_output("base-commit\n")),
+            Ok(successful_output(&format!("{BASE_COMMIT_ID}\n"))),
             Ok(successful_output("")),
             Err(GitExecError::NonZeroExit {
                 code: Some(1),
@@ -428,6 +645,7 @@ mod tests {
                     "worktree".to_string(),
                     "list".to_string(),
                     "--porcelain".to_string(),
+                    "-z".to_string(),
                 ],
                 stdout: String::new(),
                 stderr: "list failed".to_string(),
@@ -440,7 +658,8 @@ mod tests {
         let result = git.create_worktree(CreateWorktreeRequest {
             repository: &repository,
             worktree_root: WorktreeRoot::new("/worktrees/task"),
-            branch_name: BranchName::new("ora/task"),
+            branch_name: branch_name("ora/task"),
+            identity_token: identity_token("worktree-task"),
         });
 
         let error = match result {
@@ -457,6 +676,7 @@ mod tests {
                     "worktree".to_string(),
                     "list".to_string(),
                     "--porcelain".to_string(),
+                    "-z".to_string(),
                 ],
                 "list failed".to_string(),
             )
@@ -476,9 +696,9 @@ mod tests {
                     "-b",
                     "ora/task",
                     "/worktrees/task",
-                    "base-commit",
+                    BASE_COMMIT_ID,
                 ],
-                vec!["worktree", "list", "--porcelain"],
+                vec!["worktree", "list", "--porcelain", "-z"],
                 vec!["worktree", "remove", "/worktrees/task", "--force"],
                 vec!["branch", "-D", "ora/task"],
             ]
@@ -495,7 +715,7 @@ mod tests {
             stderr: "worktree cleanup failed".to_string(),
         };
         let runner = SequencedRunner::new(vec![
-            Ok(successful_output("base-commit\n")),
+            Ok(successful_output(&format!("{BASE_COMMIT_ID}\n"))),
             Ok(successful_output("")),
             Err(GitExecError::NonZeroExit {
                 code: Some(1),
@@ -503,6 +723,7 @@ mod tests {
                     "worktree".to_string(),
                     "list".to_string(),
                     "--porcelain".to_string(),
+                    "-z".to_string(),
                 ],
                 stdout: String::new(),
                 stderr: "list failed".to_string(),
@@ -516,7 +737,8 @@ mod tests {
         let result = git.create_worktree(CreateWorktreeRequest {
             repository: &repository,
             worktree_root: WorktreeRoot::new("/worktrees/task"),
-            branch_name: BranchName::new("ora/task"),
+            branch_name: branch_name("ora/task"),
+            identity_token: identity_token("worktree-task"),
         });
 
         assert!(result.is_err());
@@ -535,13 +757,102 @@ mod tests {
                     "-b",
                     "ora/task",
                     "/worktrees/task",
-                    "base-commit",
+                    BASE_COMMIT_ID,
                 ],
-                vec!["worktree", "list", "--porcelain"],
+                vec!["worktree", "list", "--porcelain", "-z"],
                 vec!["worktree", "remove", "/worktrees/task", "--force"],
                 vec!["branch", "-D", "ora/task"],
             ]
         );
+    }
+
+    /// Verifies a stale trusted handle cannot delete a replacement branch at the same path and git directory.
+    #[test]
+    fn rejects_reused_path_with_changed_git_identity() {
+        let repository = Repository::new(RepoRoot::new("/repo"));
+        let stale_worktree = WorktreeHandle::discovered(
+            repository.root().clone(),
+            WorktreeRoot::new("/worktrees/task"),
+            GitDir::new("/repo/.git/worktrees/task-old"),
+            WorktreeKind::Linked {
+                name: "task-old".to_string(),
+            },
+            CommitId::new("0123456789abcdef0123456789abcdef01234567")
+                .expect("test commit id should be valid"),
+            Some(branch_name("ora/task")),
+            None,
+        )
+        .with_identity_token(identity_token("worktree-old"));
+        let runner = SequencedRunner::new(vec![
+            Ok(successful_output(concat!(
+                "worktree /repo\0",
+                "HEAD 0123456789abcdef0123456789abcdef01234567\0",
+                "branch refs/heads/main\0\0",
+                "worktree /worktrees/task\0",
+                "HEAD 89abcdef0123456789abcdef0123456789abcdef\0",
+                "branch refs/heads/ora/task-new\0\0",
+            ))),
+            Ok(successful_output("/repo/.git\n")),
+            Ok(successful_output("/repo/.git/worktrees/task-old\n")),
+        ]);
+        let git = Git::new(runner);
+
+        let error = git
+            .delete_worktree(DeleteWorktreeRequest {
+                repository: &repository,
+                worktree: &stale_worktree,
+                mode: WorktreeDeletionMode::Force,
+            })
+            .expect_err("changed identity must be rejected");
+
+        assert!(matches!(
+            error,
+            GitlancerError::Domain(crate::DomainError::WorktreeIdentityChanged {
+                expected_git_dir,
+                actual_git_dir,
+                expected_branch,
+                actual_branch,
+                ..
+            }) if expected_git_dir.as_path() == std::path::Path::new("/repo/.git/worktrees/task-old")
+                && actual_git_dir.as_path() == std::path::Path::new("/repo/.git/worktrees/task-old")
+                && expected_branch.as_deref() == Some("ora/task")
+                && actual_branch.as_deref() == Some("ora/task-new")
+        ));
+        assert_eq!(git.runner().commands.borrow().len(), 3);
+    }
+
+    /// Verifies the safe deletion API refuses handles that have no durable instance marker.
+    #[test]
+    fn rejects_unmanaged_worktree_deletion() {
+        let repository = Repository::new(RepoRoot::new("/repo"));
+        let unmanaged_worktree = WorktreeHandle::discovered(
+            repository.root().clone(),
+            WorktreeRoot::new("/worktrees/task"),
+            GitDir::new("/repo/.git/worktrees/task"),
+            WorktreeKind::Linked {
+                name: "task".to_string(),
+            },
+            CommitId::new(BASE_COMMIT_ID).expect("test commit id should be valid"),
+            Some(branch_name("ora/task")),
+            None,
+        );
+        let git = Git::new(SequencedRunner::new(Vec::new()));
+
+        let error = git
+            .delete_worktree(DeleteWorktreeRequest {
+                repository: &repository,
+                worktree: &unmanaged_worktree,
+                mode: WorktreeDeletionMode::Force,
+            })
+            .expect_err("unmanaged worktrees must not enter destructive deletion");
+
+        assert!(matches!(
+            error,
+            GitlancerError::Domain(
+                crate::DomainError::UnmanagedWorktreeDeletionUnsupported(path)
+            ) if path == std::path::Path::new("/worktrees/task")
+        ));
+        assert_eq!(git.runner().commands.borrow().len(), 0);
     }
 
     /// Creates one successful fake output without repeating process metadata in test setup.

@@ -46,7 +46,7 @@ flowchart LR
 
 ## 固定基线
 
-创建 Task worktree 时，后端先读取项目仓库当前 `HEAD`，再创建 linked worktree，并把该 commit 保存为 Worktree 的 `base_commit_id`。
+创建 Task worktree 时，后端先验证请求项目与当前 Git 仓库绑定的项目一致，并以 `ProvisioningPending` 状态持久化目标绝对路径和分支；随后读取项目仓库当前 `HEAD`、创建 linked worktree，把该 commit 保存为 Worktree 的 `base_commit_id`，Task 写入成功后才切换为 `Active`。
 
 之后所有 Task Diff 都比较：
 
@@ -70,6 +70,10 @@ Git 进程的 stdout 和 stderr 使用有界并发读取；任一输出超过预
 重命名文件的评论路径遵循 diff side：`side = old` 时提交旧路径，`side = new` 时提交新路径。HTTP adapter 会把所有 Task diff Git/SQLite 操作交给 Tokio blocking worker，避免阻塞异步请求线程。
 
 历史 worktree 的基线通过 `WorktreeBaseline::unavailable()` 表示，而不是空字符串；只有新建 Task 能通过校验构造记录状态。内部字段保持私有，因此调用方无法绕过构造器制造空的 recorded baseline。历史 Task 不会被猜测性地绑定到错误 commit，尝试读取其 diff 时返回 `409 task_diff_baseline_unavailable`。
+
+Task Diff 与 Task 删除使用创建时持久化的 checkout 绝对路径，不再从当前 `work_dir` 配置重新派生。创建流程还会把持久化的 `WorktreeId` 写入 linked worktree 私有 Git 目录作为身份标记；读取和删除要求 checkout 根路径、分支及该不可复用标记全部匹配。即使路径、分支和 Git administration 名称被原样复用，旧 Task 也无法读取或删除新的 checkout。历史上缺少可信路径、分支或身份标记的记录不会进入破坏性流程。
+
+Task 删除会先把持久化 worktree 生命周期写为 `RemovalPending`，只有身份一致才执行幂等删除。成功后依次软删除 Task 和 Worktree；任一步中断都会保留可见的 pending worktree。Web runtime 启动时会同时协调 `ProvisioningPending` 与 `RemovalPending`：已经拥有完整 Task 的创建记录被激活，没有 Task 的孤儿 checkout 被删除，未完成删除则继续重试。若 checkout 已被外部移除，恢复流程会执行 `git worktree prune --expire=now` 清理残留管理数据后继续持久化清理。
 
 ## Diff API
 

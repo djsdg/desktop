@@ -36,6 +36,11 @@ pub enum ApplicationError {
     TaskNotFound { task_id: String },
     #[error("task repository operation failed: {message}")]
     TaskRepository { message: String },
+    #[error("task project mismatch: expected {expected_project_id}, found {actual_project_id}")]
+    TaskProjectMismatch {
+        expected_project_id: String,
+        actual_project_id: String,
+    },
     #[error("task worktree operation failed: {message}")]
     TaskWorktree { message: String },
     #[error("task diff operation failed: {message}")]

@@ -75,7 +75,7 @@ impl<R: GitRunner> Git<R> {
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .map(|line| BranchName::new(line.to_string()))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(ListBranchesResponse { branches })
     }
@@ -186,6 +186,11 @@ mod tests {
     use crate::exec::runner::GitRunner;
     use crate::git::{Git, branch::ListBranchesRequest};
 
+    /// Creates a validated branch fixture for command and lifecycle assertions.
+    fn branch_name(value: &str) -> BranchName {
+        BranchName::new(value).expect("test branch should be valid")
+    }
+
     /// Captures Git commands and returns queued outputs so lifecycle tests can verify assembly and intent.
     #[derive(Debug, Default)]
     struct TestRunner {
@@ -244,7 +249,7 @@ mod tests {
 
         assert_eq!(
             response.branches,
-            vec![BranchName::new("main"), BranchName::new("feature/runtime")]
+            vec![branch_name("main"), branch_name("feature/runtime")]
         );
         assert_eq!(
             git.runner().recorded_commands(),
@@ -274,11 +279,11 @@ mod tests {
         let response = git
             .create_branch(CreateBranchRequest {
                 repository: &repository,
-                branch_name: BranchName::new("feature/runtime"),
+                branch_name: branch_name("feature/runtime"),
             })
             .expect("create branch");
 
-        assert_eq!(response.branch, BranchName::new("feature/runtime"));
+        assert_eq!(response.branch, branch_name("feature/runtime"));
         assert_eq!(
             git.runner().recorded_commands(),
             vec![
@@ -316,7 +321,7 @@ mod tests {
         let error = git
             .create_branch(CreateBranchRequest {
                 repository: &repository,
-                branch_name: BranchName::new("feature/runtime"),
+                branch_name: branch_name("feature/runtime"),
             })
             .expect_err("duplicate branch should be rejected");
 
@@ -349,12 +354,12 @@ mod tests {
         let response = git
             .delete_branch(DeleteBranchRequest {
                 repository: &repository,
-                branch_name: BranchName::new("feature/runtime"),
+                branch_name: branch_name("feature/runtime"),
                 mode: BranchDeletionMode::Force,
             })
             .expect("delete branch");
 
-        assert_eq!(response.branch, BranchName::new("feature/runtime"));
+        assert_eq!(response.branch, branch_name("feature/runtime"));
         assert_eq!(
             git.runner().recorded_commands()[1],
             GitCommand::new(
@@ -384,7 +389,7 @@ mod tests {
         let error = git
             .delete_branch(DeleteBranchRequest {
                 repository: &repository,
-                branch_name: BranchName::new("feature/runtime"),
+                branch_name: branch_name("feature/runtime"),
                 mode: BranchDeletionMode::Checked,
             })
             .expect_err("unknown branch should be rejected");
@@ -407,11 +412,11 @@ mod tests {
 
         let create_command = build_create_branch_command(&CreateBranchRequest {
             repository: &repository,
-            branch_name: BranchName::new("feature/runtime"),
+            branch_name: branch_name("feature/runtime"),
         });
         let delete_command = build_delete_branch_command(&DeleteBranchRequest {
             repository: &repository,
-            branch_name: BranchName::new("feature/runtime"),
+            branch_name: branch_name("feature/runtime"),
             mode: BranchDeletionMode::Checked,
         });
 

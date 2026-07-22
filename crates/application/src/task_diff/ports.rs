@@ -1,4 +1,4 @@
-use ora_domain::{TaskDiffComment, TaskDiffCommentId, TaskId};
+use ora_domain::{TaskDiffComment, TaskDiffCommentId, TaskId, WorktreeId};
 use std::path::PathBuf;
 
 /// Supplies task-scoped Git differences while hiding Git and filesystem implementation details.
@@ -12,10 +12,12 @@ pub trait TaskDiffReader {
     ) -> Result<TaskDiffSnapshot, TaskDiffReaderError>;
 }
 
-/// Carries the backend-owned worktree path and immutable comparison baseline.
+/// Carries the backend-owned worktree identity and immutable comparison baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadTaskDiffRequest {
+    pub expected_worktree_id: WorktreeId,
     pub worktree_path: PathBuf,
+    pub expected_branch_name: String,
     pub base_commit_id: String,
 }
 

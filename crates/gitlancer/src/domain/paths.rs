@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use crate::error::DomainError;
+
 /// Identifies the canonical root directory of a Git repository.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RepoRoot(PathBuf);
@@ -53,9 +55,23 @@ impl GitDir {
 pub struct RepoRelativePath(PathBuf);
 
 impl RepoRelativePath {
-    /// Creates a repo-relative path wrapper from a path that has already been validated by a worktree-aware API.
-    pub(crate) fn new(path: impl AsRef<Path>) -> Self {
-        Self(path.as_ref().to_path_buf())
+    /// Creates a repository-relative path while rejecting absolute and parent-traversing inputs.
+    pub(crate) fn new(path: impl AsRef<Path>) -> Result<Self, DomainError> {
+        let path = path.as_ref();
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(DomainError::InvalidRepoRelativePath(path.to_path_buf()));
+        }
+
+        Ok(Self(path.to_path_buf()))
     }
 
     /// Exposes the repo-relative path for command assembly.

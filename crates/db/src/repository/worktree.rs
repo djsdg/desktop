@@ -1,5 +1,8 @@
 use ora_application::{WorktreeRepository, WorktreeRepositoryError};
-use ora_domain::{AuditFields, TaskId, Worktree, WorktreeActivity, WorktreeBaseline, WorktreeId};
+use ora_domain::{
+    AuditFields, ManagedWorktreeIdentity, ProjectId, TaskId, Worktree, WorktreeBaseline,
+    WorktreeId, WorktreeLifecycle,
+};
 use rusqlite::{Row, params};
 
 use crate::repository::{RepositoryPool, connection::bool_to_sqlite};
@@ -23,14 +26,16 @@ impl WorktreeRepository for SqliteWorktreeRepository {
         self.pool
             .with_connection(|connection| {
                 connection.execute(
-                    "INSERT INTO worktrees (id, task_id, branch_name, base_commit_id, is_active, created_at, updated_at, is_deleted)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO worktrees (id, task_id, project_id, branch_name, worktree_root, base_commit_id, lifecycle, created_at, updated_at, is_deleted)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         worktree.id.as_ref(),
                         worktree.task_id.as_ref(),
-                        worktree.branch_name.as_deref(),
+                        worktree.project_id.as_ref(),
+                        worktree.branch_name(),
+                        worktree.root().map(|root| root.to_string_lossy().into_owned()),
                         baseline_value(&worktree.baseline),
-                        worktree.activity.database_value(),
+                        worktree.lifecycle().database_value(),
                         worktree.audit_fields.created_at,
                         worktree.audit_fields.updated_at,
                         bool_to_sqlite(worktree.audit_fields.is_deleted),
@@ -50,7 +55,7 @@ impl WorktreeRepository for SqliteWorktreeRepository {
         self.pool
             .with_connection(|connection| {
                 let mut statement = connection.prepare(
-                    "SELECT id, task_id, branch_name, base_commit_id, is_active, created_at, updated_at, is_deleted
+                    "SELECT id, task_id, project_id, branch_name, worktree_root, base_commit_id, lifecycle, created_at, updated_at, is_deleted
                      FROM worktrees
                      WHERE id = ?1 AND is_deleted = 0",
                 )?;
@@ -69,7 +74,7 @@ impl WorktreeRepository for SqliteWorktreeRepository {
         self.pool
             .with_connection(|connection| {
                 let mut statement = connection.prepare(
-                    "SELECT id, task_id, branch_name, base_commit_id, is_active, created_at, updated_at, is_deleted
+                    "SELECT id, task_id, project_id, branch_name, worktree_root, base_commit_id, lifecycle, created_at, updated_at, is_deleted
                      FROM worktrees
                      WHERE is_deleted = 0
                      ORDER BY created_at, id",
@@ -92,14 +97,16 @@ impl WorktreeRepository for SqliteWorktreeRepository {
             .with_connection(|connection| {
                 let updated_rows = connection.execute(
                     "UPDATE worktrees
-                     SET task_id = ?2, branch_name = ?3, base_commit_id = ?4, is_active = ?5, created_at = ?6, updated_at = ?7, is_deleted = ?8
+                     SET task_id = ?2, project_id = ?3, branch_name = ?4, worktree_root = ?5, base_commit_id = ?6, lifecycle = ?7, created_at = ?8, updated_at = ?9, is_deleted = ?10
                      WHERE id = ?1 AND is_deleted = 0",
                     params![
                         worktree.id.as_ref(),
                         worktree.task_id.as_ref(),
-                        worktree.branch_name.as_deref(),
+                        worktree.project_id.as_ref(),
+                        worktree.branch_name(),
+                        worktree.root().map(|root| root.to_string_lossy().into_owned()),
                         baseline_value(&worktree.baseline),
-                        worktree.activity.database_value(),
+                        worktree.lifecycle().database_value(),
                         worktree.audit_fields.created_at,
                         worktree.audit_fields.updated_at,
                         bool_to_sqlite(worktree.audit_fields.is_deleted),
@@ -138,20 +145,42 @@ impl WorktreeRepository for SqliteWorktreeRepository {
 
 /// Reconstructs a domain worktree from the selected worktree columns.
 fn map_worktree_row(row: &Row<'_>) -> Result<Worktree, crate::DatabaseError> {
-    let activity = WorktreeActivity::from_database_value(row.get("is_active")?)?;
+    let lifecycle = WorktreeLifecycle::from_database_value(row.get("lifecycle")?)?;
     let is_deleted = row.get::<_, i64>("is_deleted")? != 0;
 
-    Ok(Worktree::new(
-        WorktreeId::new(row.get::<_, String>("id")?),
-        TaskId::new(row.get::<_, String>("task_id")?),
-        row.get::<_, Option<String>>("branch_name")?,
-        match row.get::<_, Option<String>>("base_commit_id")? {
-            Some(commit_id) => WorktreeBaseline::recorded(commit_id)?,
-            None => WorktreeBaseline::unavailable(),
-        },
-        activity,
-        AuditFields::new(row.get("created_at")?, row.get("updated_at")?, is_deleted),
-    ))
+    let id = WorktreeId::new(row.get::<_, String>("id")?);
+    let task_id = TaskId::new(row.get::<_, String>("task_id")?);
+    let project_id = ProjectId::new(row.get::<_, String>("project_id")?);
+    let baseline = match row.get::<_, Option<String>>("base_commit_id")? {
+        Some(commit_id) => WorktreeBaseline::recorded(commit_id)?,
+        None => WorktreeBaseline::unavailable(),
+    };
+    let audit_fields = AuditFields::new(row.get("created_at")?, row.get("updated_at")?, is_deleted);
+    let root = row.get::<_, Option<String>>("worktree_root")?;
+    let branch_name = row.get::<_, Option<String>>("branch_name")?;
+
+    match root.filter(|root| !root.is_empty()) {
+        Some(root) => Ok(Worktree::managed(
+            id,
+            task_id,
+            project_id,
+            ManagedWorktreeIdentity::new(
+                root.into(),
+                branch_name.ok_or(ora_domain::DomainModelError::EmptyManagedWorktreeBranch)?,
+            )?,
+            baseline,
+            lifecycle,
+            audit_fields,
+        )),
+        None => Ok(Worktree::legacy(
+            id,
+            task_id,
+            project_id,
+            baseline,
+            lifecycle,
+            audit_fields,
+        )),
+    }
 }
 
 /// Maps the explicit domain baseline state into the nullable migration representation.

@@ -8,6 +8,7 @@ use ora_contracts::{
     UpdateTaskResponse,
 };
 use serde::Deserialize;
+use std::sync::Arc;
 
 /// Carries the request path segment used by task identifier routes.
 #[derive(Debug, Deserialize)]
@@ -30,11 +31,8 @@ pub async fn create_task(
     State(app_state): State<AppState>,
     Json(request): Json<CreateTaskRequest>,
 ) -> Result<Json<CreateTaskResponse>, WebApiError> {
-    app_state
-        .task_api()
-        .create_task(request)
-        .map(Json)
-        .map_err(WebApiError::from)
+    let api = Arc::clone(app_state.task_api());
+    run_blocking(move || api.create_task(request)).await
 }
 
 /// Loads one task by combining the path identifier into the contract request.
@@ -42,24 +40,21 @@ pub async fn get_task(
     State(app_state): State<AppState>,
     Path(path): Path<TaskPath>,
 ) -> Result<Json<GetTaskResponse>, WebApiError> {
-    app_state
-        .task_api()
-        .get_task(GetTaskRequest {
+    let api = Arc::clone(app_state.task_api());
+    run_blocking(move || {
+        api.get_task(GetTaskRequest {
             task_id: path.task_id,
         })
-        .map(Json)
-        .map_err(WebApiError::from)
+    })
+    .await
 }
 
 /// Lists every visible task by delegating to the application handler.
 pub async fn list_tasks(
     State(app_state): State<AppState>,
 ) -> Result<Json<ListTasksResponse>, WebApiError> {
-    app_state
-        .task_api()
-        .list_tasks(ListTasksRequest {})
-        .map(Json)
-        .map_err(WebApiError::from)
+    let api = Arc::clone(app_state.task_api());
+    run_blocking(move || api.list_tasks(ListTasksRequest {})).await
 }
 
 /// Replaces one task by combining the route identifier with the JSON body payload.
@@ -68,16 +63,16 @@ pub async fn update_task(
     Path(path): Path<TaskPath>,
     Json(body): Json<UpdateTaskBody>,
 ) -> Result<Json<UpdateTaskResponse>, WebApiError> {
-    app_state
-        .task_api()
-        .update_task(UpdateTaskRequest {
+    let api = Arc::clone(app_state.task_api());
+    run_blocking(move || {
+        api.update_task(UpdateTaskRequest {
             task_id: path.task_id,
             project_id: body.project_id,
             title: body.title,
             status: body.status,
         })
-        .map(Json)
-        .map_err(WebApiError::from)
+    })
+    .await
 }
 
 /// Deletes one task by combining the path identifier into the contract request.
@@ -85,11 +80,49 @@ pub async fn delete_task(
     State(app_state): State<AppState>,
     Path(path): Path<TaskPath>,
 ) -> Result<Json<DeleteTaskResponse>, WebApiError> {
-    app_state
-        .task_api()
-        .delete_task(DeleteTaskRequest {
+    let api = Arc::clone(app_state.task_api());
+    run_blocking(move || {
+        api.delete_task(DeleteTaskRequest {
             task_id: path.task_id,
         })
+    })
+    .await
+}
+
+/// Runs synchronous Git and SQLite task services outside Tokio's asynchronous worker pool.
+async fn run_blocking<Response, Operation>(
+    operation: Operation,
+) -> Result<Json<Response>, WebApiError>
+where
+    Response: Send + 'static,
+    Operation: FnOnce() -> Result<Response, ora_application::ApplicationError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| WebApiError::internal_error(format!("task worker failed: {error}")))?
         .map(Json)
         .map_err(WebApiError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use super::run_blocking;
+
+    /// Verifies synchronous task services cannot execute on a single-threaded async worker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn runs_task_services_on_the_blocking_pool() {
+        let async_worker = thread::current().id();
+        let result = run_blocking(move || {
+            Ok::<_, ora_application::ApplicationError>(thread::current().id())
+        })
+        .await;
+        let blocking_worker = match result {
+            Ok(worker) => worker.0,
+            Err(_) => panic!("blocking task service should complete"),
+        };
+
+        assert_ne!(blocking_worker, async_worker);
+    }
 }

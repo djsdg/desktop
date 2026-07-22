@@ -1,7 +1,8 @@
 use crate::bootstrap::SystemClock;
 use ora_application::{
-    ApplicationError, CreateTaskHandler, DeleteTaskHandler, GetTaskHandler,
-    GitTaskWorktreeProvisioner, ListTasksHandler, UpdateTaskHandler, UuidTaskIdGenerator,
+    ApplicationError, CreateTaskConfiguration, CreateTaskHandler, DeleteTaskHandler,
+    GetTaskHandler, GitTaskWorktreeProvisioner, ListTasksHandler,
+    RecoverPendingTaskWorktreesHandler, UpdateTaskHandler, UuidTaskIdGenerator,
     UuidWorktreeIdGenerator,
 };
 use ora_contracts::{
@@ -9,6 +10,8 @@ use ora_contracts::{
     GetTaskResponse, ListTasksRequest, ListTasksResponse, UpdateTaskRequest, UpdateTaskResponse,
 };
 use ora_db::{RepositoryPool, SqliteTaskRepository, SqliteWorktreeRepository};
+use ora_domain::ProjectId;
+use ora_logging::{ora_error, ora_info};
 use std::path::PathBuf;
 
 /// Groups the transport-facing task entry points for the web adapter.
@@ -37,12 +40,31 @@ impl TaskApi {
     pub fn new(
         pool: RepositoryPool,
         project_root: PathBuf,
+        project_id: ProjectId,
         work_dir: PathBuf,
         clock: SystemClock,
     ) -> Self {
         let task_repository = SqliteTaskRepository::new(pool.clone());
         let worktree_repository = SqliteWorktreeRepository::new(pool);
         let worktree_provisioner = GitTaskWorktreeProvisioner::new(project_root);
+        let recovery = RecoverPendingTaskWorktreesHandler::new(
+            task_repository.clone(),
+            worktree_repository.clone(),
+            worktree_provisioner.clone(),
+            project_id.clone(),
+            clock,
+        );
+        match recovery.handle() {
+            Ok(report) => ora_info!(
+                message = "task worktree recovery completed",
+                recovered = report.recovered,
+                failed = report.failed,
+            ),
+            Err(error) => ora_error!(
+                message = "task worktree recovery failed",
+                error = %error,
+            ),
+        }
 
         Self {
             create_task: CreateTaskHandler::new(
@@ -51,17 +73,17 @@ impl TaskApi {
                 UuidTaskIdGenerator::new(),
                 UuidWorktreeIdGenerator::new(),
                 worktree_provisioner.clone(),
-                work_dir.clone(),
+                CreateTaskConfiguration::new(project_id.clone(), work_dir.clone()),
                 clock,
             ),
             get_task: GetTaskHandler::new(task_repository.clone()),
             list_tasks: ListTasksHandler::new(task_repository.clone()),
-            update_task: UpdateTaskHandler::new(task_repository.clone(), clock),
+            update_task: UpdateTaskHandler::new(task_repository.clone(), project_id.clone(), clock),
             delete_task: DeleteTaskHandler::new(
                 task_repository,
                 worktree_repository,
                 worktree_provisioner,
-                work_dir,
+                project_id,
                 clock,
             ),
         }

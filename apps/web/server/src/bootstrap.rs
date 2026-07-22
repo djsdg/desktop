@@ -10,7 +10,7 @@ use ora_application::{
 };
 use ora_contracts::{OpenProjectWorkContextRequest, ProjectWorkContextSurface};
 use ora_db::{DatabaseBootstrapper, DatabaseLocation, RepositoryPool, default_migration_catalog};
-use ora_domain::{AuditFields, Project};
+use ora_domain::{AuditFields, Project, ProjectId};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -21,7 +21,8 @@ pub fn build_app_state(runtime_config: &RuntimeConfig) -> Result<AppState, WebBo
     let pool = build_repository_pool(runtime_config.database().path())?;
     let clock = SystemClock;
 
-    reconcile_configured_project(&pool, runtime_config.project(), clock)?;
+    let configured_project_id =
+        reconcile_configured_project(&pool, runtime_config.project(), clock)?;
 
     Ok(AppState::new(
         Arc::new(AgentApi::new(pool.clone(), clock)),
@@ -30,13 +31,14 @@ pub fn build_app_state(runtime_config: &RuntimeConfig) -> Result<AppState, WebBo
         Arc::new(TaskApi::new(
             pool.clone(),
             runtime_config.project().path().to_path_buf(),
+            configured_project_id.clone(),
             runtime_config.project().work_dir().to_path_buf(),
             clock,
         )),
         Arc::new(TaskDiffApi::new(
             pool.clone(),
             runtime_config.project().path().to_path_buf(),
-            runtime_config.project().work_dir().to_path_buf(),
+            configured_project_id,
             clock,
         )),
         Arc::new(SessionApi::new(pool.clone(), clock)),
@@ -61,13 +63,14 @@ pub(crate) fn build_app_state_for_database(
         Arc::new(TaskApi::new(
             pool.clone(),
             project_root.to_path_buf(),
+            ProjectId::new("project-1"),
             work_dir.to_path_buf(),
             clock,
         )),
         Arc::new(TaskDiffApi::new(
             pool.clone(),
             project_root.to_path_buf(),
-            work_dir.to_path_buf(),
+            ProjectId::new("project-1"),
             clock,
         )),
         Arc::new(SessionApi::new(pool.clone(), clock)),
@@ -80,7 +83,7 @@ fn reconcile_configured_project(
     pool: &RepositoryPool,
     project_config: &ProjectConfig,
     clock: SystemClock,
-) -> Result<(), WebBootstrapError> {
+) -> Result<ProjectId, WebBootstrapError> {
     let repository = ora_db::SqliteProjectRepository::new(pool.clone());
     let context_repository = ora_db::SqliteProjectWorkContextRepository::new(pool.clone());
     let configured_project_path = project_config.path().to_string_lossy().to_string();
@@ -136,7 +139,7 @@ fn reconcile_configured_project(
             window_id: "main".to_string(),
             project_id: project_id.to_string(),
         })
-        .map(|_| ())
+        .map(|_| project_id)
         .map_err(project_work_context_bootstrap_error)
 }
 

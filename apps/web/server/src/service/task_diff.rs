@@ -13,6 +13,7 @@ use ora_contracts::{
 use ora_db::{
     RepositoryPool, SqliteTaskDiffCommentRepository, SqliteTaskRepository, SqliteWorktreeRepository,
 };
+use ora_domain::ProjectId;
 use std::path::PathBuf;
 
 type CreateCommentHandler = CreateTaskDiffCommentHandler<
@@ -49,7 +50,7 @@ impl TaskDiffApi {
     pub fn new(
         pool: RepositoryPool,
         project_root: PathBuf,
-        work_dir: PathBuf,
+        project_id: ProjectId,
         clock: SystemClock,
     ) -> Self {
         let task_repository = SqliteTaskRepository::new(pool.clone());
@@ -62,7 +63,7 @@ impl TaskDiffApi {
                 task_repository.clone(),
                 worktree_repository.clone(),
                 diff_reader.clone(),
-                work_dir.clone(),
+                project_id.clone(),
             ),
             list_comments: ListTaskDiffCommentsHandler::new(
                 task_repository.clone(),
@@ -75,7 +76,7 @@ impl TaskDiffApi {
                 comment_repository.clone(),
                 UuidTaskDiffCommentIdGenerator::new(),
                 clock,
-                work_dir,
+                project_id,
             ),
             reply_comment: ReplyTaskDiffCommentHandler::new(
                 task_repository.clone(),

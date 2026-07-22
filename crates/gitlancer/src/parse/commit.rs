@@ -12,7 +12,7 @@ pub fn parse_commit_response(stdout: &str) -> Result<CommitResponse, ParseError>
     let summary = lines.next().ok_or(ParseError::MissingLine)?;
 
     Ok(CommitResponse {
-        commit_id: CommitId::new(commit_id.to_string()),
+        commit_id: CommitId::new(commit_id.to_string()).map_err(|_| ParseError::InvalidCommit)?,
         summary: summary.to_string(),
     })
 }
@@ -25,5 +25,5 @@ pub fn parse_commit_id(stdout: &str) -> Result<CommitId, ParseError> {
         .find(|line| !line.is_empty())
         .ok_or(ParseError::MissingLine)?;
 
-    Ok(CommitId::new(line.to_string()))
+    CommitId::new(line.to_string()).map_err(|_| ParseError::InvalidCommit)
 }

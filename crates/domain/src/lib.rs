@@ -34,4 +34,6 @@ pub use task_diff_comment::{
 };
 pub use virtual_entry::{VirtualEntry, VirtualEntryKind};
 pub use virtual_folder::VirtualFolder;
-pub use worktree::{Worktree, WorktreeActivity, WorktreeBaseline};
+pub use worktree::{
+    ManagedWorktreeIdentity, Worktree, WorktreeBaseline, WorktreeIdentity, WorktreeLifecycle,
+};

@@ -104,6 +104,9 @@ pub struct WorktreeHandle {
     worktree_root: WorktreeRoot,
     git_dir: GitDir,
     kind: WorktreeKind,
+    head_commit_id: CommitId,
+    branch: Option<BranchName>,
+    identity_token: Option<WorktreeIdentityToken>,
 }
 
 pub enum WorktreeKind {
@@ -117,6 +120,12 @@ This structure makes multi-worktree support explicit and removes ambiguity betwe
 - the repository root,
 - the directory where a command should run,
 - the gitdir backing that worktree.
+
+`Repository` and `WorktreeHandle` values are created only by Git-backed discovery; their constructors are not part of the public API. Listing uses NUL-delimited `git worktree list --porcelain -z`, then resolves each operational checkout with `git rev-parse --absolute-git-dir`. Ora-managed creation writes the persisted worktree id as a bounded identity marker inside the private Git administration directory. Deletion re-discovers the checkout and verifies the marker together with the resolved Git directory and checked-out branch before mutation. Path, branch, and Git administration-name reuse therefore cannot make a replacement checkout satisfy a stale handle. This prevents linked-worktree `.git` pointer files or caller-assembled metadata from being mistaken for a trusted Git identity.
+
+Bare repository records are modeled separately because Git omits checkout-only HEAD and branch fields for them. Discovery retains the bare repository as the owning `RepoRoot`, while listing returns only its operational linked worktrees. Name-based resolution applies only to linked worktrees, so a valid linked administration name such as `main` cannot collide with the main checkout.
+
+The application-owned persisted `ora_domain::Worktree` is a separate lifecycle record. New records store a managed absolute checkout root and branch together, begin in `ProvisioningPending`, become `Active` only after Task persistence, and enter `RemovalPending` before deletion. Startup reconciliation completes both interrupted creation and deletion. Historical rows without a persisted root decode as `LegacyUnavailable` and are never passed to destructive Git operations.
 
 ## Request / Response Style
 
@@ -141,6 +150,13 @@ pub struct ListWorktreesRequest<'a> {
 pub struct CreateBranchRequest<'a> {
     pub repository: &'a Repository,
     pub branch_name: BranchName,
+}
+
+pub struct CreateWorktreeRequest<'a> {
+    pub repository: &'a Repository,
+    pub worktree_root: WorktreeRoot,
+    pub branch_name: BranchName,
+    pub identity_token: WorktreeIdentityToken,
 }
 
 pub struct DeleteWorktreeRequest<'a> {
@@ -177,6 +193,10 @@ Suggested intents:
 - `Network`
 
 Ora can use those intents to decide whether a command can run automatically, needs confirmation, or should be retried.
+
+`CliGitRunner` applies a finite execution deadline, closes stdin, and bounds captured stdout and stderr by default. Diff operations may select smaller per-command limits through `run_bounded`. The deadline remains active until Git has exited and both captured streams have closed, including when a detached hook or alias descendant inherits a pipe. On timeout or output overflow, the runner terminates Git's complete process tree by reusing `ora-process` (Unix process groups or Windows Job Objects), so hooks and aliases cannot leave descendants running. Every attempt reports command and completion events through the optional `GitlancerLogger`. These controls keep hooks, malformed repositories, and unexpectedly large command output from blocking, leaking processes, or exhausting the host process.
+
+Task diff generation forces stable `a/` and `b/` path prefixes, reads `HEAD` before collecting tracked and untracked patches, and verifies it again afterward. A concurrent commit or checkout therefore produces a typed snapshot-change error instead of returning a patch paired with stale revision metadata. Git commands that accept caller-selected repository paths use literal pathspec mode so pathspec-like filenames cannot widen the requested operation.
 
 ## Parsing Strategy
 
@@ -235,6 +255,8 @@ Priority integration scenarios:
 - parse `status --porcelain=v2 -z`,
 - handle linked-worktree `.git` indirection correctly.
 
-## Notes
+## Implementation Status
 
-The Rust skeleton added alongside this document is intentionally light on behavior and heavy on boundaries, so the next implementation step can focus on filling in domain validation, command assembly, and parsing logic without redesigning the module graph again.
+The v1 runtime implements repository discovery, trusted worktree discovery, branch lifecycle operations, structured status and commit parsing, linked-worktree creation and identity-safe deletion, bounded task diffs, and optional structured logging. Ora's task integration resolves task worktrees by exact checkout root and verifies the persisted branch plus worktree-id marker before reading a diff or deleting a checkout.
+
+Network operations are intentionally outside the current runtime specification. `GitIntent::Network` remains available for a future fetch, pull, push, or clone design, but its presence does not imply those operations are implemented.

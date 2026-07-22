@@ -8,7 +8,7 @@ pub struct Repository {
 
 impl Repository {
     /// Creates a repository handle from a validated repository root.
-    pub fn new(root: RepoRoot) -> Self {
+    pub(crate) fn new(root: RepoRoot) -> Self {
         Self { root }
     }
 

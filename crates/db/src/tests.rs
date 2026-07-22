@@ -63,8 +63,77 @@ fn bootstraps_empty_database_with_default_catalog() {
             AppliedMigration::new("0002", 1_700_000_000_000),
             AppliedMigration::new("0003", 1_700_000_000_000),
             AppliedMigration::new("0004", 1_700_000_000_000),
+            AppliedMigration::new("0005", 1_700_000_000_000),
+            AppliedMigration::new("0006", 1_700_000_000_000),
         ]
     );
+}
+
+/// Verifies the worktree lifecycle migration backfills project ownership from its task.
+#[test]
+fn backfills_worktree_project_ownership_during_lifecycle_migration() {
+    let temp_dir = TempDir::new().unwrap();
+    let database_path = temp_dir.path().join("worktree-project-migration.sqlite3");
+    let catalog = default_migration_catalog().unwrap();
+    let pre_lifecycle_catalog = MigrationCatalog::new(
+        ["0001", "0002", "0003", "0004"]
+            .into_iter()
+            .map(|version| {
+                catalog
+                    .migration(version)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("missing migration {version}"))
+            })
+            .collect(),
+    )
+    .unwrap();
+    bootstrap_file_database(&database_path, pre_lifecycle_catalog, 1_700_000_000_000);
+    let connection = Connection::open(&database_path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO projects (id, name, root_path, created_at, updated_at, is_deleted)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            params!["project-1", "Ora", "/workspace/ora", 1_i64, 1_i64],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tasks (id, project_id, title, status, created_at, updated_at, is_deleted)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, 0)",
+            params!["task-1", "project-1", "Task", 1_i64, 1_i64],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO worktrees (id, task_id, branch_name, base_commit_id, is_active, created_at, updated_at, is_deleted)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, 0)",
+            params![
+                "worktree-1",
+                "task-1",
+                "ora/12345678",
+                "base-commit",
+                1_i64,
+                1_i64,
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    bootstrap_file_database(
+        &database_path,
+        default_migration_catalog().unwrap(),
+        1_700_000_000_100,
+    );
+
+    let connection = Connection::open(&database_path).unwrap();
+    let project_id = connection
+        .query_row(
+            "SELECT project_id FROM worktrees WHERE id = ?1",
+            params!["worktree-1"],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    assert_eq!(project_id, "project-1");
 }
 
 /// Verifies the catalog creates ID-keyed schema without name indexes and removes it during rollback.
@@ -73,7 +142,7 @@ fn manages_skill_and_agent_definition_schema_lifecycle() {
     let temp_dir = TempDir::new().unwrap();
     let database_path = temp_dir.path().join("skill-agent.sqlite3");
     let catalog = default_migration_catalog().unwrap();
-    let migrations = ["0001", "0002", "0003", "0004"].map(|version| {
+    let migrations = ["0001", "0002", "0003", "0004", "0005", "0006"].map(|version| {
         catalog
             .migration(version)
             .cloned()

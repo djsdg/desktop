@@ -16,23 +16,22 @@
 //! [`ProcessTree::kill`] mirrors the `start_kill` contract used by [`crate::ManagedProcess::kill`]:
 //! it delivers the termination request to the OS and returns without waiting for any process to
 //! actually exit. Callers that need the final exit status must still reap the direct child via
-//! [`crate::ManagedProcess::wait`].
+//! [`crate::ManagedProcess::wait`] or [`std::process::Child::wait`].
 
 use std::io;
-
-use tokio::process::{Child, Command};
+use std::process::Command;
 
 /// Owns the OS resources required to terminate an entire process tree rooted at one spawned
 /// child process.
 ///
-/// Created from a freshly-spawned child and held by the lifecycle task so every kill path
-/// (explicit `kill()`, `kill_on_drop`, and lifecycle task teardown) goes through one entry point.
+/// Created from a freshly-spawned child and held by its lifecycle owner so every kill path goes
+/// through one platform-independent entry point.
 /// Dropping this handle is an *ordinary* release: on Windows it disarms
 /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` before closing the Job Object handle, so releasing this
 /// handle never terminates the tree on its own. Tree-wide termination only ever happens through
 /// the explicit [`ProcessTree::kill`] path (`TerminateJobObject`), which is unaffected by
 /// disarming since it acts immediately rather than on handle close.
-pub(crate) struct ProcessTree {
+pub struct ProcessTree {
     #[cfg(unix)]
     pgid: i32,
     #[cfg(windows)]
@@ -54,7 +53,7 @@ impl ProcessTree {
     ///
     /// On Unix this places the child in its own process group; on Windows the Job Object is
     /// created after spawn, so nothing is configured here.
-    pub(crate) fn configure_command(command: &mut Command) {
+    pub fn configure_command(command: &mut Command) {
         #[cfg(unix)]
         {
             // A process group of 0 makes the child a process group leader with pgid == child pid.
@@ -70,32 +69,26 @@ impl ProcessTree {
         }
     }
 
-    /// Builds a process-tree handle from a freshly-spawned child.
+    /// Builds a process-tree handle from the platform process id of a freshly-spawned child.
     ///
     /// On Windows this creates the Job Object with `KILL_ON_JOB_CLOSE` and assigns the running
     /// child to it. There is a small race window between spawn and assignment where the child
     /// could fork a subprocess that escapes the job; for Ora's agent runtimes this race is
-    /// acceptable and unavoidable without `CREATE_SUSPENDED` plumbing that the tokio `Command`
-    /// type does not expose.
-    pub(crate) fn from_spawned(child: &Child) -> io::Result<Self> {
+    /// acceptable and unavoidable without `CREATE_SUSPENDED` plumbing that the standard
+    /// `Command` type does not expose.
+    pub fn from_spawned_id(child_id: u32) -> io::Result<Self> {
         #[cfg(unix)]
         {
-            let pid = child
-                .id()
-                .ok_or_else(|| io::Error::other("spawned child has no platform pid"))?
-                as i32;
+            let pid = child_id as i32;
             Ok(Self { pgid: pid })
         }
 
         #[cfg(windows)]
         {
-            let pid = child
-                .id()
-                .ok_or_else(|| io::Error::other("spawned child has no platform pid"))?;
             let job = create_kill_on_close_job()?;
             // If assignment fails we must release the just-created job handle, otherwise it would
             // leak and immediately kill the freshly-spawned child via KILL_ON_JOB_CLOSE.
-            if let Err(error) = assign_child_to_job(job, pid) {
+            if let Err(error) = assign_child_to_job(job, child_id) {
                 close_handle(job);
                 return Err(error);
             }
@@ -109,7 +102,7 @@ impl ProcessTree {
     /// Returns `Ok(())` when the request was accepted by the OS or when the tree is already gone
     /// (for example ESRCH on Unix when the process group no longer exists). Returns `Err` only when
     /// the OS refused the request for a reason callers should surface (for example EPERM).
-    pub(crate) fn kill(&self) -> io::Result<()> {
+    pub fn kill(&self) -> io::Result<()> {
         #[cfg(unix)]
         {
             kill_process_group(self.pgid)

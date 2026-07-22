@@ -1,11 +1,16 @@
 use crate::{
     AgentDefinition, AgentDefinitionId, AgentId, Artifact, ArtifactId, AuditFields,
-    DomainModelError, Project, ProjectId, ProjectWorkContext, ProjectWorkContextId,
-    ProjectWorkContextSurface, Session, SessionId, SessionStatus, Skill, SkillId, Task, TaskId,
-    TaskStatus, VirtualEntry, VirtualEntryId, VirtualEntryKind, VirtualFolder, VirtualFolderId,
-    Worktree, WorktreeActivity, WorktreeBaseline, WorktreeId,
+    DomainModelError, ManagedWorktreeIdentity, Project, ProjectId, ProjectWorkContext,
+    ProjectWorkContextId, ProjectWorkContextSurface, Session, SessionId, SessionStatus, Skill,
+    SkillId, Task, TaskId, TaskStatus, VirtualEntry, VirtualEntryId, VirtualEntryKind,
+    VirtualFolder, VirtualFolderId, Worktree, WorktreeBaseline, WorktreeId, WorktreeLifecycle,
 };
 use pretty_assertions::assert_eq;
+
+/// Builds a platform-native absolute root for managed-worktree domain fixtures.
+fn managed_worktree_root(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join("ora-domain-worktrees").join(name)
+}
 
 /// Verifies the domain can represent one fully populated example of each schema-backed entity.
 #[test]
@@ -17,12 +22,17 @@ fn constructs_schema_backed_entities() {
         "/workspace/ora",
         audit_fields.clone(),
     );
-    let worktree = Worktree::new(
+    let worktree = Worktree::managed(
         WorktreeId::new("worktree-1"),
         TaskId::new("task-1"),
-        Some("feature/domain-models".to_string()),
+        ProjectId::new("project-1"),
+        ManagedWorktreeIdentity::new(
+            managed_worktree_root("worktree-1"),
+            "feature/domain-models".to_string(),
+        )
+        .unwrap(),
         WorktreeBaseline::recorded("base-commit").unwrap(),
-        WorktreeActivity::Active,
+        WorktreeLifecycle::Active,
         audit_fields.clone(),
     );
     let task = Task::new(
@@ -98,14 +108,19 @@ fn constructs_schema_backed_entities() {
     );
     assert_eq!(
         worktree,
-        Worktree {
-            id: WorktreeId::new("worktree-1"),
-            task_id: TaskId::new("task-1"),
-            branch_name: Some("feature/domain-models".to_string()),
-            baseline: WorktreeBaseline::recorded("base-commit").unwrap(),
-            activity: WorktreeActivity::Active,
-            audit_fields: audit_fields.clone(),
-        }
+        Worktree::managed(
+            WorktreeId::new("worktree-1"),
+            TaskId::new("task-1"),
+            ProjectId::new("project-1"),
+            ManagedWorktreeIdentity::new(
+                managed_worktree_root("worktree-1"),
+                "feature/domain-models".to_string(),
+            )
+            .unwrap(),
+            WorktreeBaseline::recorded("base-commit").unwrap(),
+            WorktreeLifecycle::Active,
+            audit_fields.clone(),
+        )
     );
     assert_eq!(
         task,
@@ -192,6 +207,54 @@ fn constructs_schema_backed_entities() {
     );
 }
 
+/// Verifies managed worktree identity cannot be partially constructed and legacy identity stays explicit.
+#[test]
+fn validates_managed_and_legacy_worktree_identity() {
+    let common = (
+        WorktreeId::new("worktree-1"),
+        TaskId::new("task-1"),
+        ProjectId::new("project-1"),
+    );
+    let managed =
+        ManagedWorktreeIdentity::new(managed_worktree_root("serde-task"), "ora/task".to_string())
+            .unwrap();
+    assert_eq!(
+        serde_json::from_str::<ManagedWorktreeIdentity>(&serde_json::to_string(&managed).unwrap())
+            .unwrap(),
+        managed
+    );
+    assert_eq!(
+        ManagedWorktreeIdentity::new("".into(), "ora/task".to_string()).unwrap_err(),
+        DomainModelError::EmptyManagedWorktreeRoot
+    );
+    let relative_root = std::path::PathBuf::from("worktrees").join("task");
+    assert_eq!(
+        ManagedWorktreeIdentity::new(relative_root.clone(), "ora/task".to_string()).unwrap_err(),
+        DomainModelError::RelativeManagedWorktreeRoot(relative_root)
+    );
+    assert_eq!(
+        ManagedWorktreeIdentity::new(managed_worktree_root("task"), "  ".to_string()).unwrap_err(),
+        DomainModelError::EmptyManagedWorktreeBranch
+    );
+    assert!(
+        serde_json::from_str::<ManagedWorktreeIdentity>(
+            r#"{"root":"relative/task","branch_name":"ora/task"}"#,
+        )
+        .is_err(),
+        "deserialization must preserve the absolute-root invariant"
+    );
+
+    let legacy = Worktree::legacy(
+        common.0,
+        common.1,
+        common.2,
+        WorktreeBaseline::unavailable(),
+        WorktreeLifecycle::Active,
+        AuditFields::new(1, 1, false),
+    );
+    assert_eq!((legacy.root(), legacy.branch_name()), (None, None));
+}
+
 /// Verifies configurable resource constructors reject names that cannot identify a resource.
 #[test]
 fn rejects_blank_skill_and_agent_definition_names() {
@@ -238,10 +301,10 @@ fn round_trips_database_backed_enums() {
     assert_eq!(TaskStatus::Done.database_value(), 2);
 
     assert_eq!(
-        WorktreeActivity::from_database_value(1),
-        Ok(WorktreeActivity::Active)
+        WorktreeLifecycle::from_database_value(1),
+        Ok(WorktreeLifecycle::Active)
     );
-    assert_eq!(WorktreeActivity::Inactive.database_value(), 0);
+    assert_eq!(WorktreeLifecycle::RemovalPending.database_value(), 2);
 
     assert_eq!(
         VirtualEntryKind::from_database_value(0),
@@ -274,8 +337,8 @@ fn rejects_invalid_database_values() {
         Err(DomainModelError::InvalidTaskStatus(7))
     );
     assert_eq!(
-        WorktreeActivity::from_database_value(-1),
-        Err(DomainModelError::InvalidWorktreeActivity(-1))
+        WorktreeLifecycle::from_database_value(-1),
+        Err(DomainModelError::InvalidWorktreeLifecycle(-1))
     );
     assert_eq!(
         VirtualEntryKind::from_database_value(9),

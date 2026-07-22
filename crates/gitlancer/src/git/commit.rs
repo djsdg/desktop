@@ -47,7 +47,7 @@ impl<R: GitRunner> Git<R> {
         })
     }
 
-    /// Creates one commit and returns typed metadata once the commit parser is implemented.
+    /// Creates one commit and returns validated metadata read back from the resulting `HEAD`.
     pub fn commit(&self, request: CommitRequest<'_>) -> Result<CommitResponse, GitlancerError> {
         let command = build_commit_command(&request);
         let _output = self.runner().run(&command)?;
@@ -76,7 +76,12 @@ impl<R: GitRunner> Git<R> {
 
 /// Builds a stable `git add` command so staging behavior can be tested independently from process execution.
 pub fn build_add_command(request: &AddRequest<'_>) -> GitCommand {
-    let mut args = vec!["add".to_string(), "--".to_string()];
+    // `--` ends option parsing but does not disable Git's `:(...)` pathspec magic.
+    let mut args = vec![
+        "--literal-pathspecs".to_string(),
+        "add".to_string(),
+        "--".to_string(),
+    ];
     args.extend(
         request
             .paths
@@ -90,6 +95,46 @@ pub fn build_add_command(request: &AddRequest<'_>) -> GitCommand {
         GitEnv::default(),
         GitIntent::Mutating,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::{AddRequest, build_add_command};
+    use crate::{
+        BranchName, CommitId, GitDir, RepoRelativePath, RepoRoot, WorktreeHandle, WorktreeKind,
+        WorktreeRoot,
+    };
+
+    /// Verifies caller paths are always passed through Git's literal pathspec mode.
+    #[test]
+    fn add_command_disables_pathspec_magic() {
+        let worktree = WorktreeHandle::discovered(
+            RepoRoot::new("/repo"),
+            WorktreeRoot::new("/repo/worktree"),
+            GitDir::new("/repo/.git/worktrees/task"),
+            WorktreeKind::Linked {
+                name: "task".to_string(),
+            },
+            CommitId::new("0123456789abcdef0123456789abcdef01234567")
+                .expect("test commit id should be valid"),
+            Some(BranchName::new("ora/task").expect("test branch should be valid")),
+            None,
+        );
+        let path = RepoRelativePath::new(":(glob)*.rs")
+            .expect("pathspec-like filename should be repository-relative");
+
+        let command = build_add_command(&AddRequest {
+            worktree: &worktree,
+            paths: vec![path],
+        });
+
+        assert_eq!(
+            command.args,
+            vec!["--literal-pathspecs", "add", "--", ":(glob)*.rs"]
+        );
+    }
 }
 
 /// Builds a stable `git commit` command so commit policy and options stay centralized.

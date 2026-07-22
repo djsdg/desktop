@@ -1,7 +1,8 @@
+use ora_process::ProcessTree;
 use std::io::{ErrorKind, Read};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -11,6 +12,16 @@ use crate::error::GitExecError;
 use crate::exec::command::GitCommand;
 use crate::exec::output::GitOutput;
 use crate::logging;
+
+const DEFAULT_MAX_STDOUT_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_STDERR_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Identifies why a running Git process had to be terminated before its natural exit.
+enum ForcedTermination {
+    OutputTooLarge { stream: &'static str, limit: usize },
+    TimedOut,
+}
 
 /// Executes one prepared Git command and returns normalized process output.
 pub trait GitRunner {
@@ -42,13 +53,33 @@ pub trait GitRunner {
 }
 
 /// Executes Git commands through the system `git` binary.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct CliGitRunner;
+#[derive(Debug, Clone, Copy)]
+pub struct CliGitRunner {
+    timeout: Duration,
+}
+
+impl CliGitRunner {
+    /// Creates a CLI runner with a finite deadline so hooks and subprocesses cannot block Ora forever.
+    pub fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl Default for CliGitRunner {
+    /// Uses a conservative five-minute deadline for local repository operations.
+    fn default() -> Self {
+        Self::new(DEFAULT_GIT_TIMEOUT)
+    }
+}
 
 impl GitRunner for CliGitRunner {
     /// Spawns the Git CLI with stable automation defaults so upper layers can trust execution semantics.
     fn run(&self, command: &GitCommand) -> Result<GitOutput, GitExecError> {
-        run_cli(command, /*limits*/ None)
+        run_cli(
+            command,
+            (DEFAULT_MAX_STDOUT_BYTES, DEFAULT_MAX_STDERR_BYTES),
+            self.timeout,
+        )
     }
 
     /// Captures Git output concurrently so neither pipe can deadlock or grow without a bound.
@@ -58,14 +89,15 @@ impl GitRunner for CliGitRunner {
         max_stdout_bytes: usize,
         max_stderr_bytes: usize,
     ) -> Result<GitOutput, GitExecError> {
-        run_cli(command, Some((max_stdout_bytes, max_stderr_bytes)))
+        run_cli(command, (max_stdout_bytes, max_stderr_bytes), self.timeout)
     }
 }
 
-/// Executes one CLI command with optional per-stream capture limits.
+/// Executes one CLI command with a deadline and per-stream capture limits.
 fn run_cli(
     command: &GitCommand,
-    limits: Option<(usize, usize)>,
+    limits: (usize, usize),
+    timeout: Duration,
 ) -> Result<GitOutput, GitExecError> {
     let logger = logging::get();
     let started_at = Instant::now();
@@ -79,20 +111,17 @@ fn run_cli(
     process.current_dir(&command.cwd);
     process.args(&command.args);
 
-    // The execution contract disables prompts and paging so agent-driven flows stay deterministic.
-    process.env(
-        "GIT_TERMINAL_PROMPT",
-        if command.env.terminal_prompt {
-            "1"
-        } else {
-            "0"
-        },
-    );
+    process.envs(&command.env.variables);
+    // Apply protected automation settings after custom variables so callers cannot re-enable prompts or paging.
+    process.env("GIT_TERMINAL_PROMPT", "0");
     process.env("LANG", &command.env.lang);
     process.env("GIT_PAGER", &command.env.pager);
-    process.envs(&command.env.variables);
 
-    process.stdout(Stdio::piped()).stderr(Stdio::piped());
+    process
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    ProcessTree::configure_command(&mut process);
     let mut child = match process.spawn() {
         Ok(child) => child,
         Err(source) => {
@@ -109,44 +138,128 @@ fn run_cli(
             });
         }
     };
+    let process_tree = match ProcessTree::from_spawned_id(child.id()) {
+        Ok(process_tree) => process_tree,
+        Err(source) => {
+            // A spawned process must never escape without an owner when tree enrollment fails.
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(ref logger) = logger {
+                logger.log_result(started_at.elapsed().as_millis() as u64, false, None);
+            }
+            return Err(GitExecError::ProcessTreeSetupFailed {
+                args: command.args.clone(),
+                source,
+            });
+        }
+    };
 
     let stdout = child.stdout.take().expect("piped stdout must be available");
     let stderr = child.stderr.take().expect("piped stderr must be available");
-    let (stdout_limit, stderr_limit) = limits.unwrap_or((usize::MAX, usize::MAX));
-    let output_exceeded = Arc::new(AtomicBool::new(false));
-    let stdout_exceeded = Arc::clone(&output_exceeded);
-    let stderr_exceeded = Arc::clone(&output_exceeded);
-    let stdout_reader =
-        std::thread::spawn(move || read_bounded(stdout, stdout_limit, stdout_exceeded));
-    let stderr_reader =
-        std::thread::spawn(move || read_bounded(stderr, stderr_limit, stderr_exceeded));
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|source| GitExecError::OutputReadFailed {
-                stream: "process status",
-                source,
-            })?
-        {
-            break status;
+    let (stdout_limit, stderr_limit) = limits;
+    let stdout_exceeded = Arc::new(AtomicBool::new(false));
+    let stderr_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_reader = std::thread::spawn({
+        let stdout_exceeded = Arc::clone(&stdout_exceeded);
+        move || read_bounded(stdout, stdout_limit, stdout_exceeded)
+    });
+    let stderr_reader = std::thread::spawn({
+        let stderr_exceeded = Arc::clone(&stderr_exceeded);
+        move || read_bounded(stderr, stderr_limit, stderr_exceeded)
+    });
+    let mut child_status = None;
+    let (status, forced_termination) = loop {
+        if child_status.is_none() {
+            child_status = match child.try_wait() {
+                Ok(status) => status,
+                Err(source) => {
+                    let status_error = GitExecError::OutputReadFailed {
+                        stream: "process status",
+                        source,
+                    };
+                    if let Err(termination_error) =
+                        terminate_process_tree(&process_tree, &mut child, command)
+                    {
+                        if let Some(ref logger) = logger {
+                            logger.log_result(started_at.elapsed().as_millis() as u64, false, None);
+                        }
+                        return Err(termination_error);
+                    }
+                    if let Some(ref logger) = logger {
+                        logger.log_result(started_at.elapsed().as_millis() as u64, false, None);
+                    }
+                    return Err(status_error);
+                }
+            };
         }
-        if output_exceeded.load(Ordering::Acquire) {
-            // Once either stream exceeds its budget, killing Git bounds CPU and I/O as well as memory.
-            // Git can exit between `try_wait` and `kill`; waiting still reaps it and lets the
-            // bounded readers return the more useful `OutputTooLarge` error in that race.
-            let _termination_result = child.kill();
-            break child
-                .wait()
-                .map_err(|source| GitExecError::OutputReadFailed {
-                    stream: "process status",
-                    source,
-                })?;
+        let exceeded_stream = if stdout_exceeded.load(Ordering::Acquire) {
+            Some(("stdout", stdout_limit))
+        } else if stderr_exceeded.load(Ordering::Acquire) {
+            Some(("stderr", stderr_limit))
+        } else {
+            None
+        };
+        if let Some((stream, limit)) = exceeded_stream {
+            let status = match terminate_process_tree(&process_tree, &mut child, command) {
+                Ok(status) => status,
+                Err(error) => {
+                    if let Some(ref logger) = logger {
+                        logger.log_result(started_at.elapsed().as_millis() as u64, false, None);
+                    }
+                    return Err(error);
+                }
+            };
+            break (
+                status,
+                Some(ForcedTermination::OutputTooLarge { stream, limit }),
+            );
+        }
+        if let Some(status) = child_status
+            && stdout_reader.is_finished()
+            && stderr_reader.is_finished()
+        {
+            break (status, None);
+        }
+        if started_at.elapsed() >= timeout {
+            let status = match terminate_process_tree(&process_tree, &mut child, command) {
+                Ok(status) => status,
+                Err(error) => {
+                    if let Some(ref logger) = logger {
+                        logger.log_result(started_at.elapsed().as_millis() as u64, false, None);
+                    }
+                    return Err(error);
+                }
+            };
+            break (status, Some(ForcedTermination::TimedOut));
         }
         std::thread::sleep(Duration::from_millis(2));
     };
-    let stdout = join_bounded_reader(stdout_reader, "stdout", stdout_limit)?;
-    let stderr = join_bounded_reader(stderr_reader, "stderr", stderr_limit)?;
+    let stdout_result = join_bounded_reader(stdout_reader, "stdout", stdout_limit);
+    let stderr_result = join_bounded_reader(stderr_reader, "stderr", stderr_limit);
     let duration_ms = started_at.elapsed().as_millis() as u64;
+    if let Some(forced_termination) = forced_termination {
+        if let Some(ref logger) = logger {
+            logger.log_result(duration_ms, false, status.code());
+        }
+        return Err(match forced_termination {
+            ForcedTermination::OutputTooLarge { stream, limit } => {
+                GitExecError::OutputTooLarge { stream, limit }
+            }
+            ForcedTermination::TimedOut => GitExecError::TimedOut {
+                args: command.args.clone(),
+                timeout_ms: timeout.as_millis() as u64,
+            },
+        });
+    }
+    let (stdout, stderr) = match (stdout_result, stderr_result) {
+        (Ok(stdout), Ok(stderr)) => (stdout, stderr),
+        (Err(error), _) | (_, Err(error)) => {
+            if let Some(ref logger) = logger {
+                logger.log_result(duration_ms, false, status.code());
+            }
+            return Err(error);
+        }
+    };
     let stdout = String::from_utf8_lossy(&stdout).into_owned();
     let stderr = String::from_utf8_lossy(&stderr).into_owned();
 
@@ -167,6 +280,30 @@ fn run_cli(
         stdout,
         stderr,
     })
+}
+
+/// Terminates Git and every descendant before reaping the direct child process.
+fn terminate_process_tree(
+    process_tree: &ProcessTree,
+    child: &mut Child,
+    command: &GitCommand,
+) -> Result<ExitStatus, GitExecError> {
+    if let Err(source) = process_tree.kill() {
+        // Fall back to killing the direct child so a tree-management failure does not leak Git too.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(GitExecError::ProcessTreeTerminationFailed {
+            args: command.args.clone(),
+            source,
+        });
+    }
+
+    child
+        .wait()
+        .map_err(|source| GitExecError::OutputReadFailed {
+            stream: "process status",
+            source,
+        })
 }
 
 /// Reads one pipe without retaining bytes beyond its limit while continuing to drain the child.
@@ -215,11 +352,27 @@ fn join_bounded_reader(
 
 /// Records commands without executing them so command-building behavior can be tested in isolation.
 #[derive(Debug, Default, Clone)]
-pub struct RecordingGitRunner;
+pub struct RecordingGitRunner {
+    commands: Arc<Mutex<Vec<GitCommand>>>,
+}
+
+impl RecordingGitRunner {
+    /// Returns a snapshot of every command received by this runner in execution order.
+    pub fn commands(&self) -> Vec<GitCommand> {
+        self.commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
 
 impl GitRunner for RecordingGitRunner {
-    /// Rejects execution because this runner exists to validate command assembly boundaries, not behavior.
+    /// Captures the command and returns a deterministic success output without spawning Git.
     fn run(&self, command: &GitCommand) -> Result<GitOutput, GitExecError> {
+        self.commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(command.clone());
         Ok(GitOutput::new(
             Some(0),
             String::new(),
@@ -231,7 +384,8 @@ impl GitRunner for RecordingGitRunner {
 
 #[cfg(test)]
 mod tests {
-    use super::read_bounded;
+    use super::{GitRunner, RecordingGitRunner, read_bounded};
+    use crate::{GitCommand, GitEnv, GitIntent};
     use pretty_assertions::assert_eq;
     use std::sync::{Arc, atomic::AtomicBool};
 
@@ -242,5 +396,21 @@ mod tests {
             read_bounded("abcdef".as_bytes(), 3, Arc::new(AtomicBool::new(false))).unwrap(),
             (b"abc".to_vec(), true)
         );
+    }
+
+    /// Verifies the public recording runner exposes captured commands instead of only echoing arguments.
+    #[test]
+    fn records_commands_in_execution_order() {
+        let runner = RecordingGitRunner::default();
+        let command = GitCommand::new(
+            "/repo".into(),
+            vec!["status".to_string()],
+            GitEnv::default(),
+            GitIntent::ReadOnly,
+        );
+
+        runner.run(&command).expect("recording should succeed");
+
+        assert_eq!(runner.commands(), vec![command]);
     }
 }

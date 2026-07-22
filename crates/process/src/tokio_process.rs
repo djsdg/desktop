@@ -43,13 +43,17 @@ impl ProcessSpawner for TokioProcessSpawner {
         command.stdout(spec.stdout_policy().as_stdio());
         command.stderr(spec.stderr_policy().as_stdio());
         command.kill_on_drop(spec.should_kill_on_drop());
-        ProcessTree::configure_command(&mut command);
+        ProcessTree::configure_command(command.as_std_mut());
 
         let mut child = command.spawn()?;
         // Build the tree handle after spawn so the child can be enrolled in its tree-wide
         // termination group on Windows. Doing it here (rather than lazily inside the lifecycle
         // task) propagates any Job Object setup failure as a spawn error.
-        let tree = match ProcessTree::from_spawned(&child) {
+        let tree = match child
+            .id()
+            .ok_or_else(|| io::Error::other("spawned child has no platform pid"))
+            .and_then(ProcessTree::from_spawned_id)
+        {
             Ok(tree) => tree,
             Err(error) => {
                 // The OS process already exists even though tree setup failed, and this function

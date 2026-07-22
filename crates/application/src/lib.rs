@@ -35,10 +35,12 @@ pub use skill::{
     SkillRepository, SkillRepositoryError, UpdateSkillHandler, UuidSkillIdGenerator,
 };
 pub use task::{
-    CreateTaskHandler, CreateTaskWorktreeRequest, CreateTaskWorktreeResponse, DeleteTaskHandler,
-    DeleteTaskWorktreeRequest, GetTaskHandler, GitTaskWorktreeProvisioner, ListTasksHandler,
+    CreateTaskConfiguration, CreateTaskHandler, CreateTaskWorktreeRequest,
+    CreateTaskWorktreeResponse, DeleteTaskHandler, DeleteTaskWorktreeRequest, GetTaskHandler,
+    GitTaskWorktreeProvisioner, ListTasksHandler, RecoverPendingTaskWorktreesHandler,
     TaskIdGenerator, TaskRepository, TaskRepositoryError, TaskWorktreeDeletionMode,
-    TaskWorktreeProvisioner, TaskWorktreeProvisionerError, UpdateTaskHandler, UuidTaskIdGenerator,
+    TaskWorktreeProvisioner, TaskWorktreeProvisionerError, TaskWorktreeRecoveryReport,
+    UpdateTaskHandler, UuidTaskIdGenerator, VerifyTaskWorktreeRequest,
 };
 pub use task_diff::{
     CreateTaskDiffCommentHandler, GetTaskDiffHandler, GitTaskDiffReader,

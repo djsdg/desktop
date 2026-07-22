@@ -1,17 +1,15 @@
 /// Holds the stable environment contract used for automated Git invocations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitEnv {
-    pub terminal_prompt: bool,
-    pub lang: String,
-    pub pager: String,
-    pub variables: BTreeMap<String, String>,
+    pub(crate) lang: String,
+    pub(crate) pager: String,
+    pub(crate) variables: BTreeMap<String, String>,
 }
 
 impl GitEnv {
     /// Returns conservative automation defaults so Git behaves predictably under an agent runtime.
     pub fn automation_defaults() -> Self {
         Self {
-            terminal_prompt: false,
             lang: "C".to_string(),
             pager: "cat".to_string(),
             variables: BTreeMap::new(),

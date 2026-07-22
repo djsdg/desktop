@@ -1,6 +1,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use crate::domain::paths::{GitDir, RepoRelativePath, RepoRoot, WorktreeRoot};
+use crate::domain::refs::{BranchName, CommitId, WorktreeIdentityToken};
 use crate::error::DomainError;
 
 /// Distinguishes the main checkout from linked worktrees because they have different lifecycle semantics.
@@ -17,21 +18,32 @@ pub struct WorktreeHandle {
     worktree_root: WorktreeRoot,
     git_dir: GitDir,
     kind: WorktreeKind,
+    head_commit_id: CommitId,
+    branch: Option<BranchName>,
+    locked_reason: Option<String>,
+    identity_token: Option<WorktreeIdentityToken>,
 }
 
 impl WorktreeHandle {
-    /// Creates a worktree handle from validated repository and worktree metadata.
-    pub fn new(
+    /// Creates a trusted handle exclusively from metadata discovered through Git.
+    pub(crate) fn discovered(
         repo_root: RepoRoot,
         worktree_root: WorktreeRoot,
         git_dir: GitDir,
         kind: WorktreeKind,
+        head_commit_id: CommitId,
+        branch: Option<BranchName>,
+        locked_reason: Option<String>,
     ) -> Self {
         Self {
             repo_root,
             worktree_root,
             git_dir,
             kind,
+            head_commit_id,
+            branch,
+            locked_reason,
+            identity_token: None,
         }
     }
 
@@ -55,6 +67,41 @@ impl WorktreeHandle {
         &self.kind
     }
 
+    /// Returns the commit checked out when Git discovered this worktree.
+    pub fn head_commit_id(&self) -> &CommitId {
+        &self.head_commit_id
+    }
+
+    /// Returns the checked-out local branch, or `None` for a detached worktree.
+    pub fn branch(&self) -> Option<&BranchName> {
+        self.branch.as_ref()
+    }
+
+    /// Returns Git's lock reason when the worktree is protected from movement or removal.
+    pub fn locked_reason(&self) -> Option<&str> {
+        self.locked_reason.as_deref()
+    }
+
+    /// Returns the durable marker for an Ora-managed worktree, if one was discovered.
+    pub fn identity_token(&self) -> Option<&WorktreeIdentityToken> {
+        self.identity_token.as_ref()
+    }
+
+    /// Attaches the marker that was durably written after linked-worktree creation.
+    pub(crate) fn with_identity_token(mut self, identity_token: WorktreeIdentityToken) -> Self {
+        self.identity_token = Some(identity_token);
+        self
+    }
+
+    /// Attaches the optional marker observed while discovering an existing checkout.
+    pub(crate) fn with_discovered_identity_token(
+        mut self,
+        identity_token: Option<WorktreeIdentityToken>,
+    ) -> Self {
+        self.identity_token = identity_token;
+        self
+    }
+
     /// Resolves a caller path into a repo-relative path while preventing traversal outside this worktree.
     pub fn resolve_repo_relative_path(
         &self,
@@ -72,7 +119,7 @@ impl WorktreeHandle {
                 }
             })?;
 
-            return Ok(RepoRelativePath::new(relative));
+            return RepoRelativePath::new(relative);
         }
 
         let normalized =
@@ -81,7 +128,7 @@ impl WorktreeHandle {
                 worktree: worktree_root.clone(),
             })?;
 
-        Ok(RepoRelativePath::new(normalized))
+        RepoRelativePath::new(normalized)
     }
 }
 

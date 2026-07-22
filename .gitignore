@@ -26,5 +26,6 @@ dist-ssr
 /target
 packages/contracts/.test-dist/
 /.data
+/.worktrees
 .tmp
 *.tsbuildinfo

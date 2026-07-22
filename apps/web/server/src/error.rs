@@ -164,6 +164,16 @@ impl From<ApplicationError> for WebApiError {
                 code: "task_repository_error",
                 message,
             },
+            ApplicationError::TaskProjectMismatch {
+                expected_project_id,
+                actual_project_id,
+            } => Self {
+                status: StatusCode::CONFLICT,
+                code: "task_project_mismatch",
+                message: format!(
+                    "task project mismatch: expected {expected_project_id}, found {actual_project_id}"
+                ),
+            },
             ApplicationError::TaskWorktree { message } => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "task_worktree_error",

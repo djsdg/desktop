@@ -1,9 +1,10 @@
 use crate::{
-    ApplicationError, Clock, CreateTaskHandler, CreateTaskWorktreeRequest,
+    ApplicationError, Clock, CreateTaskConfiguration, CreateTaskHandler, CreateTaskWorktreeRequest,
     CreateTaskWorktreeResponse, DeleteTaskHandler, DeleteTaskWorktreeRequest, GetTaskHandler,
-    ListTasksHandler, TaskIdGenerator, TaskRepository, TaskRepositoryError,
-    TaskWorktreeDeletionMode, TaskWorktreeProvisioner, TaskWorktreeProvisionerError,
-    UpdateTaskHandler, WorktreeIdGenerator, WorktreeRepository, WorktreeRepositoryError,
+    ListTasksHandler, RecoverPendingTaskWorktreesHandler, TaskIdGenerator, TaskRepository,
+    TaskRepositoryError, TaskWorktreeDeletionMode, TaskWorktreeProvisioner,
+    TaskWorktreeProvisionerError, UpdateTaskHandler, VerifyTaskWorktreeRequest,
+    WorktreeIdGenerator, WorktreeRepository, WorktreeRepositoryError,
 };
 use ora_contracts::{
     CreateTaskRequest, CreateTaskResponse, DeleteTaskRequest, DeleteTaskResponse, GetTaskRequest,
@@ -11,22 +12,31 @@ use ora_contracts::{
     TaskStatus as ContractTaskStatus, UpdateTaskRequest, UpdateTaskResponse,
 };
 use ora_domain::{
-    AuditFields, ProjectId, Task, TaskId, TaskStatus as DomainTaskStatus, Worktree,
-    WorktreeActivity as DomainWorktreeActivity, WorktreeId,
+    AuditFields, ManagedWorktreeIdentity, ProjectId, Task, TaskId, TaskStatus as DomainTaskStatus,
+    Worktree, WorktreeId, WorktreeLifecycle as DomainWorktreeLifecycle,
 };
 use ora_logging::{with_recorded_trace_logging, with_trace_logging};
 use pretty_assertions::assert_eq;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
 const TASK_ID: &str = "12345678-1234-5678-90ab-1234567890ab";
-const WORK_DIR: &str = "/tmp/ora-worktrees";
+
+/// Builds a platform-native absolute root for in-memory task worktree fixtures.
+fn test_work_dir() -> PathBuf {
+    std::env::temp_dir().join("ora-application-worktrees")
+}
+
+/// Builds the fixed project boundary shared by task creation tests.
+fn create_task_configuration(work_dir: PathBuf) -> CreateTaskConfiguration {
+    CreateTaskConfiguration::new(ProjectId::new("project-1"), work_dir)
+}
 
 /// Verifies create handlers provision and persist task-owned worktrees before returning the shared response.
 #[test]
@@ -41,7 +51,7 @@ fn creates_tasks_with_owned_worktrees_and_clock_values() {
             FixedTaskIdGenerator::new(TASK_ID),
             FixedWorktreeIdGenerator::new("worktree-1"),
             provisioner.clone(),
-            PathBuf::from(WORK_DIR),
+            create_task_configuration(test_work_dir()),
             FixedClock::new(1_700_000_000_000),
         );
 
@@ -67,18 +77,24 @@ fn creates_tasks_with_owned_worktrees_and_clock_values() {
         assert_eq!(
             provisioner.created_requests(),
             vec![CreateTaskWorktreeRequest {
+                worktree_id: WorktreeId::new("worktree-1"),
                 branch_name: "ora/12345678".to_string(),
-                worktree_path: Path::new(WORK_DIR).join(TASK_ID),
+                worktree_path: test_work_dir().join(TASK_ID),
             }]
         );
         assert_eq!(
             worktree_repository.visible_worktrees(),
-            vec![Worktree::new(
+            vec![Worktree::managed(
                 WorktreeId::new("worktree-1"),
                 TaskId::new(TASK_ID),
-                Some("ora/12345678".to_string()),
+                ProjectId::new("project-1"),
+                ManagedWorktreeIdentity::new(
+                    test_work_dir().join(TASK_ID),
+                    "ora/12345678".to_string(),
+                )
+                .unwrap(),
                 ora_domain::WorktreeBaseline::recorded("base-commit").unwrap(),
-                DomainWorktreeActivity::Active,
+                DomainWorktreeLifecycle::Active,
                 AuditFields::new(1_700_000_000_000, 1_700_000_000_000, false),
             )]
         );
@@ -93,6 +109,47 @@ fn creates_tasks_with_owned_worktrees_and_clock_values() {
                 AuditFields::new(1_700_000_000_000, 1_700_000_000_000, false),
             )]
         );
+    });
+}
+
+/// Verifies a configured Git repository cannot create worktrees for another project id.
+#[test]
+fn rejects_task_creation_for_another_project() {
+    with_trace_logging(|| {
+        let task_repository = Rc::new(FakeTaskRepository::default());
+        let worktree_repository = Rc::new(FakeWorktreeRepository::default());
+        let provisioner = Rc::new(FakeTaskWorktreeProvisioner::default());
+        let handler = CreateTaskHandler::new(
+            task_repository.clone(),
+            worktree_repository.clone(),
+            FixedTaskIdGenerator::new(TASK_ID),
+            FixedWorktreeIdGenerator::new("worktree-1"),
+            provisioner.clone(),
+            create_task_configuration(test_work_dir()),
+            FixedClock::new(10),
+        );
+
+        let error = handler
+            .handle(CreateTaskRequest {
+                project_id: "project-2".to_string(),
+                title: "Wrong project".to_string(),
+                status: ContractTaskStatus::Todo,
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ApplicationError::TaskProjectMismatch {
+                expected_project_id: "project-1".to_string(),
+                actual_project_id: "project-2".to_string(),
+            }
+        );
+        assert_eq!(task_repository.visible_tasks(), Vec::<Task>::new());
+        assert_eq!(
+            worktree_repository.visible_worktrees(),
+            Vec::<Worktree>::new()
+        );
+        assert_eq!(provisioner.created_requests(), Vec::new());
     });
 }
 
@@ -115,7 +172,7 @@ fn regenerates_task_ids_when_branch_prefix_folder_exists() {
             ]),
             FixedWorktreeIdGenerator::new("worktree-1"),
             provisioner.clone(),
-            work_dir.clone(),
+            create_task_configuration(work_dir.clone()),
             FixedClock::new(1_700_000_000_000),
         );
 
@@ -141,6 +198,7 @@ fn regenerates_task_ids_when_branch_prefix_folder_exists() {
         assert_eq!(
             provisioner.created_requests(),
             vec![CreateTaskWorktreeRequest {
+                worktree_id: WorktreeId::new("worktree-1"),
                 branch_name: "ora/87654321".to_string(),
                 worktree_path: work_dir.join("87654321-1234-5678-90ab-1234567890ab"),
             }]
@@ -176,7 +234,7 @@ fn regenerates_task_ids_when_orphaned_branch_exists() {
             ]),
             FixedWorktreeIdGenerator::new("worktree-1"),
             provisioner.clone(),
-            work_dir.clone(),
+            create_task_configuration(work_dir.clone()),
             FixedClock::new(1_700_000_000_000),
         );
 
@@ -202,6 +260,7 @@ fn regenerates_task_ids_when_orphaned_branch_exists() {
         assert_eq!(
             provisioner.created_requests(),
             vec![CreateTaskWorktreeRequest {
+                worktree_id: WorktreeId::new("worktree-1"),
                 branch_name: "ora/87654321".to_string(),
                 worktree_path: work_dir.join("87654321-1234-5678-90ab-1234567890ab"),
             }]
@@ -221,7 +280,7 @@ fn creates_task_when_work_dir_does_not_exist() {
             FixedTaskIdGenerator::new(TASK_ID),
             FixedWorktreeIdGenerator::new("worktree-1"),
             provisioner.clone(),
-            work_dir.clone(),
+            create_task_configuration(work_dir.clone()),
             FixedClock::new(1_700_000_000_000),
         );
 
@@ -247,6 +306,7 @@ fn creates_task_when_work_dir_does_not_exist() {
         assert_eq!(
             provisioner.created_requests(),
             vec![CreateTaskWorktreeRequest {
+                worktree_id: WorktreeId::new("worktree-1"),
                 branch_name: "ora/12345678".to_string(),
                 worktree_path: work_dir.join(TASK_ID),
             }]
@@ -269,7 +329,7 @@ fn reports_task_worktree_error_when_task_id_retries_are_exhausted() {
             FixedTaskIdGenerator::new(TASK_ID),
             FixedWorktreeIdGenerator::new("worktree-1"),
             Rc::new(FakeTaskWorktreeProvisioner::default()),
-            work_dir.clone(),
+            create_task_configuration(work_dir.clone()),
             FixedClock::new(1_700_000_000_000),
         );
 
@@ -408,12 +468,16 @@ fn updates_tasks_with_refreshed_timestamps() {
             None,
             AuditFields::new(10, 20, false),
         )]));
-        let handler = UpdateTaskHandler::new(repository.clone(), FixedClock::new(30));
+        let handler = UpdateTaskHandler::new(
+            repository.clone(),
+            ProjectId::new("project-1"),
+            FixedClock::new(30),
+        );
 
         let response = handler
             .handle(UpdateTaskRequest {
                 task_id: "task-1".to_string(),
-                project_id: "project-2".to_string(),
+                project_id: "project-1".to_string(),
                 title: "Ship updated handlers".to_string(),
                 status: ContractTaskStatus::Done,
             })
@@ -424,7 +488,7 @@ fn updates_tasks_with_refreshed_timestamps() {
             UpdateTaskResponse {
                 task: ContractTask {
                     id: "task-1".to_string(),
-                    project_id: "project-2".to_string(),
+                    project_id: "project-1".to_string(),
                     title: "Ship updated handlers".to_string(),
                     status: ContractTaskStatus::Done,
                 },
@@ -434,13 +498,52 @@ fn updates_tasks_with_refreshed_timestamps() {
             repository.visible_tasks(),
             vec![Task::new(
                 TaskId::new("task-1"),
-                ProjectId::new("project-2"),
+                ProjectId::new("project-1"),
                 "Ship updated handlers",
                 DomainTaskStatus::Done,
                 None,
                 AuditFields::new(10, 30, false),
             )]
         );
+    });
+}
+
+/// Verifies task updates cannot reassign a worktree-backed task to another project.
+#[test]
+fn rejects_task_project_reassignment() {
+    with_trace_logging(|| {
+        let original_task = Task::new(
+            TaskId::new("task-1"),
+            ProjectId::new("project-1"),
+            "Ship handlers",
+            DomainTaskStatus::Todo,
+            Some(WorktreeId::new("worktree-1")),
+            AuditFields::new(10, 20, false),
+        );
+        let repository = Rc::new(FakeTaskRepository::with_tasks(vec![original_task.clone()]));
+        let handler = UpdateTaskHandler::new(
+            repository.clone(),
+            ProjectId::new("project-1"),
+            FixedClock::new(30),
+        );
+
+        let error = handler
+            .handle(UpdateTaskRequest {
+                task_id: "task-1".to_string(),
+                project_id: "project-2".to_string(),
+                title: "Moved task".to_string(),
+                status: ContractTaskStatus::Doing,
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ApplicationError::TaskProjectMismatch {
+                expected_project_id: "project-1".to_string(),
+                actual_project_id: "project-2".to_string(),
+            }
+        );
+        assert_eq!(repository.visible_tasks(), vec![original_task]);
     });
 }
 
@@ -456,21 +559,27 @@ fn deletes_tasks_and_owned_worktrees() {
             Some(WorktreeId::new("worktree-1")),
             AuditFields::new(10, 20, false),
         )]));
-        let worktree_repository =
-            Rc::new(FakeWorktreeRepository::with_worktrees(vec![Worktree::new(
+        let worktree_repository = Rc::new(FakeWorktreeRepository::with_worktrees(vec![
+            Worktree::managed(
                 WorktreeId::new("worktree-1"),
                 TaskId::new(TASK_ID),
-                Some("ora/12345678".to_string()),
+                ProjectId::new("project-1"),
+                ManagedWorktreeIdentity::new(
+                    test_work_dir().join(TASK_ID),
+                    "ora/12345678".to_string(),
+                )
+                .unwrap(),
                 ora_domain::WorktreeBaseline::recorded("base-commit").unwrap(),
-                DomainWorktreeActivity::Active,
+                DomainWorktreeLifecycle::Active,
                 AuditFields::new(10, 20, false),
-            )]));
+            ),
+        ]));
         let provisioner = Rc::new(FakeTaskWorktreeProvisioner::default());
         let handler = DeleteTaskHandler::new(
             task_repository.clone(),
             worktree_repository.clone(),
             provisioner.clone(),
-            PathBuf::from(WORK_DIR),
+            ProjectId::new("project-1"),
             FixedClock::new(40),
         );
 
@@ -489,7 +598,9 @@ fn deletes_tasks_and_owned_worktrees() {
         assert_eq!(
             provisioner.deleted_requests(),
             vec![DeleteTaskWorktreeRequest {
-                worktree_path: Path::new(WORK_DIR).join(TASK_ID),
+                expected_worktree_id: WorktreeId::new("worktree-1"),
+                worktree_path: test_work_dir().join(TASK_ID),
+                expected_branch_name: "ora/12345678".to_string(),
                 mode: TaskWorktreeDeletionMode::Force,
             }]
         );
@@ -497,6 +608,389 @@ fn deletes_tasks_and_owned_worktrees() {
         assert_eq!(
             worktree_repository.visible_worktrees(),
             Vec::<Worktree>::new()
+        );
+    });
+}
+
+/// Verifies a failed Git removal leaves durable pending state for a later recovery pass.
+#[test]
+fn preserves_removal_pending_state_when_git_deletion_fails() {
+    with_trace_logging(|| {
+        let task_repository = Rc::new(FakeTaskRepository::with_tasks(vec![Task::new(
+            TaskId::new(TASK_ID),
+            ProjectId::new("project-1"),
+            "Ship handlers",
+            DomainTaskStatus::Todo,
+            Some(WorktreeId::new("worktree-1")),
+            AuditFields::new(10, 20, false),
+        )]));
+        let worktree_repository = Rc::new(FakeWorktreeRepository::with_worktrees(vec![
+            Worktree::managed(
+                WorktreeId::new("worktree-1"),
+                TaskId::new(TASK_ID),
+                ProjectId::new("project-1"),
+                ManagedWorktreeIdentity::new(
+                    test_work_dir().join(TASK_ID),
+                    "ora/12345678".to_string(),
+                )
+                .unwrap(),
+                ora_domain::WorktreeBaseline::recorded("base-commit").unwrap(),
+                DomainWorktreeLifecycle::Active,
+                AuditFields::new(10, 20, false),
+            ),
+        ]));
+        let provisioner = Rc::new(FakeTaskWorktreeProvisioner::default());
+        provisioner.fail_next_delete(TaskWorktreeProvisionerError::OperationFailed(
+            "git remove failed".to_string(),
+        ));
+        let handler = DeleteTaskHandler::new(
+            task_repository.clone(),
+            worktree_repository.clone(),
+            provisioner,
+            ProjectId::new("project-1"),
+            FixedClock::new(40),
+        );
+
+        let error = handler
+            .handle(DeleteTaskRequest {
+                task_id: TASK_ID.to_string(),
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ApplicationError::TaskWorktree {
+                message: "git remove failed".to_string(),
+            }
+        );
+        assert_eq!(task_repository.visible_tasks().len(), 1);
+        assert_eq!(
+            worktree_repository.visible_worktrees()[0].lifecycle(),
+            DomainWorktreeLifecycle::RemovalPending
+        );
+    });
+}
+
+/// Verifies startup recovery completes pending Git and persistence cleanup idempotently.
+#[test]
+fn recovers_pending_task_worktree_removals() {
+    with_trace_logging(|| {
+        let task_repository = Rc::new(FakeTaskRepository::with_tasks(vec![Task::new(
+            TaskId::new(TASK_ID),
+            ProjectId::new("project-1"),
+            "Ship handlers",
+            DomainTaskStatus::Todo,
+            Some(WorktreeId::new("worktree-1")),
+            AuditFields::new(10, 20, false),
+        )]));
+        let worktree_repository = Rc::new(FakeWorktreeRepository::with_worktrees(vec![
+            Worktree::managed(
+                WorktreeId::new("worktree-1"),
+                TaskId::new(TASK_ID),
+                ProjectId::new("project-1"),
+                ManagedWorktreeIdentity::new(
+                    test_work_dir().join(TASK_ID),
+                    "ora/12345678".to_string(),
+                )
+                .unwrap(),
+                ora_domain::WorktreeBaseline::recorded("base-commit").unwrap(),
+                DomainWorktreeLifecycle::RemovalPending,
+                AuditFields::new(10, 30, false),
+            ),
+        ]));
+        let provisioner = Rc::new(FakeTaskWorktreeProvisioner::default());
+        let handler = RecoverPendingTaskWorktreesHandler::new(
+            task_repository.clone(),
+            worktree_repository.clone(),
+            provisioner.clone(),
+            ProjectId::new("project-1"),
+            FixedClock::new(40),
+        );
+
+        let report = handler.handle().unwrap();
+
+        assert_eq!(
+            report,
+            crate::TaskWorktreeRecoveryReport {
+                recovered: 1,
+                failed: 0,
+            }
+        );
+        assert_eq!(
+            provisioner.deleted_requests(),
+            vec![DeleteTaskWorktreeRequest {
+                expected_worktree_id: WorktreeId::new("worktree-1"),
+                worktree_path: test_work_dir().join(TASK_ID),
+                expected_branch_name: "ora/12345678".to_string(),
+                mode: TaskWorktreeDeletionMode::Force,
+            }]
+        );
+        assert_eq!(task_repository.visible_tasks(), Vec::<Task>::new());
+        assert_eq!(
+            worktree_repository.visible_worktrees(),
+            Vec::<Worktree>::new()
+        );
+    });
+}
+
+/// Verifies startup recovery removes an orphaned checkout left before task persistence.
+#[test]
+fn recovers_orphaned_pending_worktree_provisioning() {
+    with_trace_logging(|| {
+        let worktree = Worktree::managed(
+            WorktreeId::new("worktree-1"),
+            TaskId::new(TASK_ID),
+            ProjectId::new("project-1"),
+            ManagedWorktreeIdentity::new(test_work_dir().join(TASK_ID), "ora/12345678".to_string())
+                .unwrap(),
+            ora_domain::WorktreeBaseline::unavailable(),
+            DomainWorktreeLifecycle::ProvisioningPending,
+            AuditFields::new(10, 20, false),
+        );
+        let task_repository = Rc::new(FakeTaskRepository::default());
+        let worktree_repository = Rc::new(FakeWorktreeRepository::with_worktrees(vec![worktree]));
+        let provisioner = Rc::new(FakeTaskWorktreeProvisioner::default());
+        let handler = RecoverPendingTaskWorktreesHandler::new(
+            task_repository,
+            worktree_repository.clone(),
+            provisioner.clone(),
+            ProjectId::new("project-1"),
+            FixedClock::new(40),
+        );
+
+        assert_eq!(
+            handler.handle().unwrap(),
+            crate::TaskWorktreeRecoveryReport {
+                recovered: 1,
+                failed: 0,
+            }
+        );
+        assert_eq!(
+            provisioner.deleted_requests(),
+            vec![DeleteTaskWorktreeRequest {
+                expected_worktree_id: WorktreeId::new("worktree-1"),
+                worktree_path: test_work_dir().join(TASK_ID),
+                expected_branch_name: "ora/12345678".to_string(),
+                mode: TaskWorktreeDeletionMode::Force,
+            }]
+        );
+        assert_eq!(
+            worktree_repository.visible_worktrees(),
+            Vec::<Worktree>::new()
+        );
+    });
+}
+
+/// Verifies startup recovery activates a fully persisted task whose final lifecycle write was interrupted.
+#[test]
+fn activates_attached_pending_worktree_provisioning() {
+    with_trace_logging(|| {
+        let task = Task::new(
+            TaskId::new(TASK_ID),
+            ProjectId::new("project-1"),
+            "Ship handlers",
+            DomainTaskStatus::Todo,
+            Some(WorktreeId::new("worktree-1")),
+            AuditFields::new(10, 20, false),
+        );
+        let worktree = Worktree::managed(
+            WorktreeId::new("worktree-1"),
+            task.id.clone(),
+            task.project_id.clone(),
+            ManagedWorktreeIdentity::new(test_work_dir().join(TASK_ID), "ora/12345678".to_string())
+                .unwrap(),
+            ora_domain::WorktreeBaseline::recorded("base-commit").unwrap(),
+            DomainWorktreeLifecycle::ProvisioningPending,
+            AuditFields::new(10, 20, false),
+        );
+        let task_repository = Rc::new(FakeTaskRepository::with_tasks(vec![task]));
+        let worktree_repository = Rc::new(FakeWorktreeRepository::with_worktrees(vec![worktree]));
+        let provisioner = Rc::new(FakeTaskWorktreeProvisioner::default());
+        let handler = RecoverPendingTaskWorktreesHandler::new(
+            task_repository,
+            worktree_repository.clone(),
+            provisioner.clone(),
+            ProjectId::new("project-1"),
+            FixedClock::new(40),
+        );
+
+        assert_eq!(handler.handle().unwrap().recovered, 1);
+        assert_eq!(provisioner.deleted_requests(), Vec::new());
+        assert_eq!(
+            provisioner.verified_requests(),
+            vec![VerifyTaskWorktreeRequest {
+                expected_worktree_id: WorktreeId::new("worktree-1"),
+                worktree_path: test_work_dir().join(TASK_ID),
+                expected_branch_name: "ora/12345678".to_string(),
+            }]
+        );
+        assert_eq!(
+            worktree_repository.visible_worktrees()[0].lifecycle(),
+            DomainWorktreeLifecycle::Active
+        );
+    });
+}
+
+/// Verifies startup recovery leaves a persisted task pending when its physical checkout cannot be trusted.
+#[test]
+fn preserves_pending_provisioning_when_worktree_verification_fails() {
+    with_trace_logging(|| {
+        let task = Task::new(
+            TaskId::new(TASK_ID),
+            ProjectId::new("project-1"),
+            "Ship handlers",
+            DomainTaskStatus::Todo,
+            Some(WorktreeId::new("worktree-1")),
+            AuditFields::new(10, 20, /*is_deleted*/ false),
+        );
+        let worktree = Worktree::managed(
+            WorktreeId::new("worktree-1"),
+            task.id.clone(),
+            task.project_id.clone(),
+            ManagedWorktreeIdentity::new(test_work_dir().join(TASK_ID), "ora/12345678".to_string())
+                .unwrap(),
+            ora_domain::WorktreeBaseline::recorded("base-commit").unwrap(),
+            DomainWorktreeLifecycle::ProvisioningPending,
+            AuditFields::new(10, 20, /*is_deleted*/ false),
+        );
+        let task_repository = Rc::new(FakeTaskRepository::with_tasks(vec![task]));
+        let worktree_repository = Rc::new(FakeWorktreeRepository::with_worktrees(vec![worktree]));
+        let provisioner = Rc::new(FakeTaskWorktreeProvisioner::default());
+        provisioner.fail_next_verify(TaskWorktreeProvisionerError::OperationFailed(
+            "worktree identity mismatch".to_string(),
+        ));
+        let handler = RecoverPendingTaskWorktreesHandler::new(
+            task_repository,
+            worktree_repository.clone(),
+            provisioner.clone(),
+            ProjectId::new("project-1"),
+            FixedClock::new(40),
+        );
+
+        assert_eq!(
+            handler.handle().unwrap(),
+            crate::TaskWorktreeRecoveryReport {
+                recovered: 0,
+                failed: 1,
+            }
+        );
+        assert_eq!(provisioner.verified_requests().len(), 1);
+        assert_eq!(
+            worktree_repository.visible_worktrees()[0].lifecycle(),
+            DomainWorktreeLifecycle::ProvisioningPending
+        );
+    });
+}
+
+/// Verifies startup recovery never consumes pending worktrees owned by another configured project.
+#[test]
+fn recovers_only_pending_worktrees_for_the_configured_project() {
+    with_trace_logging(|| {
+        let task_one = Task::new(
+            TaskId::new("task-1"),
+            ProjectId::new("project-1"),
+            "First task",
+            DomainTaskStatus::Todo,
+            Some(WorktreeId::new("worktree-1")),
+            AuditFields::new(10, 20, /*is_deleted*/ false),
+        );
+        let task_two = Task::new(
+            TaskId::new("task-2"),
+            ProjectId::new("project-2"),
+            "Second task",
+            DomainTaskStatus::Todo,
+            Some(WorktreeId::new("worktree-2")),
+            AuditFields::new(11, 21, /*is_deleted*/ false),
+        );
+        let worktree_one = Worktree::managed(
+            WorktreeId::new("worktree-1"),
+            task_one.id.clone(),
+            task_one.project_id.clone(),
+            ManagedWorktreeIdentity::new(
+                test_work_dir().join("task-1"),
+                "ora/11111111".to_string(),
+            )
+            .unwrap(),
+            ora_domain::WorktreeBaseline::recorded("base-commit").unwrap(),
+            DomainWorktreeLifecycle::RemovalPending,
+            AuditFields::new(10, 30, /*is_deleted*/ false),
+        );
+        let worktree_two = Worktree::managed(
+            WorktreeId::new("worktree-2"),
+            task_two.id.clone(),
+            task_two.project_id.clone(),
+            ManagedWorktreeIdentity::new(
+                test_work_dir().join("task-2"),
+                "ora/22222222".to_string(),
+            )
+            .unwrap(),
+            ora_domain::WorktreeBaseline::recorded("base-commit").unwrap(),
+            DomainWorktreeLifecycle::RemovalPending,
+            AuditFields::new(11, 31, /*is_deleted*/ false),
+        );
+        let task_repository = Rc::new(FakeTaskRepository::with_tasks(vec![
+            task_one,
+            task_two.clone(),
+        ]));
+        let worktree_repository = Rc::new(FakeWorktreeRepository::with_worktrees(vec![
+            worktree_one,
+            worktree_two.clone(),
+        ]));
+        let provisioner = Rc::new(FakeTaskWorktreeProvisioner::default());
+        let handler = RecoverPendingTaskWorktreesHandler::new(
+            task_repository.clone(),
+            worktree_repository.clone(),
+            provisioner.clone(),
+            ProjectId::new("project-1"),
+            FixedClock::new(40),
+        );
+
+        let report = handler.handle().unwrap();
+
+        assert_eq!(
+            report,
+            crate::TaskWorktreeRecoveryReport {
+                recovered: 1,
+                failed: 0,
+            }
+        );
+        assert_eq!(
+            provisioner.deleted_requests(),
+            vec![DeleteTaskWorktreeRequest {
+                expected_worktree_id: WorktreeId::new("worktree-1"),
+                worktree_path: test_work_dir().join("task-1"),
+                expected_branch_name: "ora/11111111".to_string(),
+                mode: TaskWorktreeDeletionMode::Force,
+            }]
+        );
+        assert_eq!(task_repository.visible_tasks(), vec![task_two]);
+        assert_eq!(worktree_repository.visible_worktrees(), vec![worktree_two]);
+    });
+}
+
+/// Verifies task deletion preserves the existing not-found contract for missing identifiers.
+#[test]
+fn reports_not_found_when_deleting_a_missing_task() {
+    with_trace_logging(|| {
+        let handler = DeleteTaskHandler::new(
+            Rc::new(FakeTaskRepository::default()),
+            Rc::new(FakeWorktreeRepository::default()),
+            Rc::new(FakeTaskWorktreeProvisioner::default()),
+            ProjectId::new("project-1"),
+            FixedClock::new(40),
+        );
+
+        let error = handler
+            .handle(DeleteTaskRequest {
+                task_id: "missing".to_string(),
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ApplicationError::TaskNotFound {
+                task_id: "missing".to_string(),
+            }
         );
     });
 }
@@ -517,7 +1011,7 @@ fn cleans_up_created_worktree_when_task_persistence_fails() {
             FixedTaskIdGenerator::new(TASK_ID),
             FixedWorktreeIdGenerator::new("worktree-1"),
             provisioner.clone(),
-            PathBuf::from(WORK_DIR),
+            create_task_configuration(test_work_dir()),
             FixedClock::new(50),
         );
 
@@ -538,7 +1032,9 @@ fn cleans_up_created_worktree_when_task_persistence_fails() {
         assert_eq!(
             provisioner.deleted_requests(),
             vec![DeleteTaskWorktreeRequest {
-                worktree_path: Path::new(WORK_DIR).join(TASK_ID),
+                expected_worktree_id: WorktreeId::new("worktree-1"),
+                worktree_path: test_work_dir().join(TASK_ID),
+                expected_branch_name: "ora/12345678".to_string(),
                 mode: TaskWorktreeDeletionMode::Force,
             }]
         );
@@ -563,7 +1059,7 @@ fn reports_application_errors() {
             FixedTaskIdGenerator::new(TASK_ID),
             FixedWorktreeIdGenerator::new("worktree-1"),
             provisioner,
-            PathBuf::from(WORK_DIR),
+            create_task_configuration(test_work_dir()),
             FixedClock::new(60),
         );
 
@@ -609,7 +1105,7 @@ fn emits_structured_operational_events() {
             FixedTaskIdGenerator::new(TASK_ID),
             FixedWorktreeIdGenerator::new("worktree-1"),
             create_provisioner,
-            PathBuf::from(WORK_DIR),
+            create_task_configuration(test_work_dir()),
             FixedClock::new(5),
         );
         let failing_task_repository = Rc::new(FakeTaskRepository::default());
@@ -624,7 +1120,7 @@ fn emits_structured_operational_events() {
             FixedTaskIdGenerator::new("87654321-1234-5678-90ab-1234567890ab"),
             FixedWorktreeIdGenerator::new("worktree-2"),
             failing_provisioner,
-            PathBuf::from(WORK_DIR),
+            create_task_configuration(test_work_dir()),
             FixedClock::new(6),
         );
 
@@ -890,8 +1386,10 @@ impl WorktreeRepository for Rc<FakeWorktreeRepository> {
 struct FakeTaskWorktreeProvisioner {
     existing_branches: RefCell<Vec<String>>,
     created_requests: RefCell<Vec<CreateTaskWorktreeRequest>>,
+    verified_requests: RefCell<Vec<VerifyTaskWorktreeRequest>>,
     deleted_requests: RefCell<Vec<DeleteTaskWorktreeRequest>>,
     next_create_error: RefCell<Option<TaskWorktreeProvisionerError>>,
+    next_verify_error: RefCell<Option<TaskWorktreeProvisionerError>>,
     next_delete_error: RefCell<Option<TaskWorktreeProvisionerError>>,
 }
 
@@ -909,9 +1407,24 @@ impl FakeTaskWorktreeProvisioner {
         self.next_create_error.replace(Some(error));
     }
 
+    /// Configures the next recovery verification to fail without activating the pending row.
+    fn fail_next_verify(&self, error: TaskWorktreeProvisionerError) {
+        self.next_verify_error.replace(Some(error));
+    }
+
+    /// Configures the next delete request to fail so recovery state can be asserted.
+    fn fail_next_delete(&self, error: TaskWorktreeProvisionerError) {
+        self.next_delete_error.replace(Some(error));
+    }
+
     /// Returns the create requests recorded by this fake provisioner.
     fn created_requests(&self) -> Vec<CreateTaskWorktreeRequest> {
         self.created_requests.borrow().clone()
+    }
+
+    /// Returns the verification requests recorded by this fake provisioner.
+    fn verified_requests(&self) -> Vec<VerifyTaskWorktreeRequest> {
+        self.verified_requests.borrow().clone()
     }
 
     /// Returns the delete requests recorded by this fake provisioner.
@@ -922,6 +1435,14 @@ impl FakeTaskWorktreeProvisioner {
     /// Returns the next queued create failure, if any.
     fn take_create_error(&self) -> Result<(), TaskWorktreeProvisionerError> {
         match self.next_create_error.borrow_mut().take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Returns the next queued verification failure, if any.
+    fn take_verify_error(&self) -> Result<(), TaskWorktreeProvisionerError> {
+        match self.next_verify_error.borrow_mut().take() {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -954,6 +1475,14 @@ impl TaskWorktreeProvisioner for Rc<FakeTaskWorktreeProvisioner> {
         Ok(CreateTaskWorktreeResponse {
             base_commit_id: "base-commit".to_string(),
         })
+    }
+
+    fn verify_task_worktree(
+        &self,
+        request: VerifyTaskWorktreeRequest,
+    ) -> Result<(), TaskWorktreeProvisionerError> {
+        self.verified_requests.borrow_mut().push(request);
+        self.take_verify_error()
     }
 
     fn delete_task_worktree(

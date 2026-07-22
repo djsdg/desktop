@@ -630,7 +630,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "projectId": "project-2",
+                            "projectId": "project-1",
                             "title": "Ship updated handlers",
                             "status": "doing",
                         })
@@ -701,7 +701,7 @@ mod tests {
             json!({
                 "task": {
                     "id": task_id,
-                    "projectId": "project-2",
+                        "projectId": "project-1",
                     "title": "Ship updated handlers",
                     "status": "doing",
                 },
@@ -718,6 +718,34 @@ mod tests {
                 .find_worktree(&WorktreeId::new(worktree_id))
                 .unwrap(),
             None
+        );
+    }
+
+    /// Verifies task worktrees cannot be provisioned into the configured repository for another project id.
+    #[tokio::test]
+    async fn rejects_task_creation_for_another_project() {
+        let (_temp_dir, _database_path, app) = test_router();
+
+        let response = request_json(
+            &app,
+            Method::POST,
+            "/api/tasks",
+            json!({
+                "projectId": "project-2",
+                "title": "Wrong repository",
+                "status": "todo",
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await,
+            json!({
+                "error": {
+                    "code": "task_project_mismatch",
+                    "message": "task project mismatch: expected project-1, found project-2",
+                },
+            })
         );
     }
 
