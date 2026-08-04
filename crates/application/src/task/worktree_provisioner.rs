@@ -41,7 +41,10 @@ impl TaskWorktreeProvisioner for GitTaskWorktreeProvisioner {
                 GitlancerError::Domain(DomainError::NotARepository(_)) => {
                     TaskWorktreeProvisionerError::NotARepository
                 }
-                source => TaskWorktreeProvisionerError::operation_failed(source),
+                source => TaskWorktreeProvisionerError::operation_failed(
+                    "failed to validate project repository",
+                    source,
+                ),
             })
     }
 
@@ -57,7 +60,12 @@ impl TaskWorktreeProvisioner for GitTaskWorktreeProvisioner {
                     .iter()
                     .any(|branch| branch.as_str() == branch_name)
             })
-            .map_err(TaskWorktreeProvisionerError::operation_failed)
+            .map_err(|source| {
+                TaskWorktreeProvisionerError::operation_failed(
+                    "failed to inspect task branches",
+                    source,
+                )
+            })
     }
 
     /// Creates one linked worktree while keeping Git-specific diagnostics inside the application.
@@ -75,7 +83,12 @@ impl TaskWorktreeProvisioner for GitTaskWorktreeProvisioner {
             .map(|response| CreateTaskWorktreeResponse {
                 base_commit_id: response.head_commit_id.as_str().to_string(),
             })
-            .map_err(TaskWorktreeProvisionerError::operation_failed)
+            .map_err(|source| {
+                TaskWorktreeProvisionerError::operation_failed(
+                    "failed to create task worktree",
+                    source,
+                )
+            })
     }
 
     /// Resolves and deletes one linked worktree through Git's authoritative branch metadata.
@@ -89,7 +102,12 @@ impl TaskWorktreeProvisioner for GitTaskWorktreeProvisioner {
                 repository: &self.repository,
                 branch_name: &request.branch_name,
             })
-            .map_err(TaskWorktreeProvisionerError::operation_failed)?;
+            .map_err(|source| {
+                TaskWorktreeProvisionerError::operation_failed(
+                    "failed to resolve task worktree",
+                    source,
+                )
+            })?;
         let mode = match request.mode {
             TaskWorktreeDeletionMode::Force => GitWorktreeDeletionMode::Force,
         };
@@ -101,15 +119,24 @@ impl TaskWorktreeProvisioner for GitTaskWorktreeProvisioner {
                 mode,
             })
             .map(|_| ())
-            .map_err(TaskWorktreeProvisionerError::operation_failed)
+            .map_err(|source| {
+                TaskWorktreeProvisionerError::operation_failed(
+                    "failed to delete task worktree",
+                    source,
+                )
+            })
     }
 }
 
 /// Creates the parent eagerly because Git expects the worktree path's ancestor to exist.
 fn create_parent_directory(worktree_path: &Path) -> Result<(), TaskWorktreeProvisionerError> {
     match worktree_path.parent() {
-        Some(parent_directory) => fs::create_dir_all(parent_directory)
-            .map_err(TaskWorktreeProvisionerError::operation_failed),
+        Some(parent_directory) => fs::create_dir_all(parent_directory).map_err(|source| {
+            TaskWorktreeProvisionerError::operation_failed(
+                "failed to create task worktree parent directory",
+                source,
+            )
+        }),
         None => Ok(()),
     }
 }

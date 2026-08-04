@@ -85,16 +85,22 @@ pub struct DeleteTaskWorktreeRequest {
 pub enum TaskWorktreeProvisionerError {
     #[error("worktree mode requires a Git repository")]
     NotARepository,
-    #[error("task worktree operation failed")]
+    #[error("{context}")]
     OperationFailed {
+        context: &'static str,
         #[source]
         source: BoxRepositorySource,
     },
 }
 
 impl TaskWorktreeProvisionerError {
-    pub fn operation_failed(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+    /// Preserves both the failed worktree operation and its infrastructure source chain.
+    pub fn operation_failed(
+        context: &'static str,
+        error: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
         Self::OperationFailed {
+            context,
             source: Box::new(error),
         }
     }
