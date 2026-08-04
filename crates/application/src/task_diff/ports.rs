@@ -127,4 +127,6 @@ pub trait TaskDiffCommentIdGenerator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskDiffCommentRepositoryError {
     OperationFailed(String),
+    Invalid(String),
+    Conflict(String),
 }

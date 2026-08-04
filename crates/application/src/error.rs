@@ -110,6 +110,8 @@ pub enum ApplicationError {
     TaskDiffCommentNotFound { comment_id: String },
     #[error("invalid task diff comment: {message}")]
     TaskDiffCommentInvalid { message: String },
+    #[error("task diff comment conflicts with stored state: {message}")]
+    TaskDiffCommentConflict { message: String },
     #[error("task diff comment repository operation failed: {message}")]
     TaskDiffCommentRepository { message: String },
     #[error("worktree not found: {worktree_id}")]
@@ -207,6 +209,12 @@ impl ApplicationError {
             TaskDiffCommentRepositoryError::OperationFailed(message) => {
                 Self::TaskDiffCommentRepository { message }
             }
+            TaskDiffCommentRepositoryError::Invalid(message) => {
+                Self::TaskDiffCommentInvalid { message }
+            }
+            TaskDiffCommentRepositoryError::Conflict(message) => {
+                Self::TaskDiffCommentConflict { message }
+            }
         }
     }
 
@@ -278,6 +286,10 @@ impl PartialEq for ApplicationError {
             | (
                 TaskDiffCommentInvalid { message: left },
                 TaskDiffCommentInvalid { message: right },
+            )
+            | (
+                TaskDiffCommentConflict { message: left },
+                TaskDiffCommentConflict { message: right },
             )
             | (
                 TaskDiffCommentRepository { message: left },
