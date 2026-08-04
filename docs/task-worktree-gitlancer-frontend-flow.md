@@ -112,6 +112,9 @@ const files = parseDiff(response.patch);
 const diff = await client.task.getDiff({ taskId });
 ```
 
+For a `project_root` task, `baseCommitId` and `headCommitId` are the same current `HEAD`.
+The project checkout can still have staged, unstaged, and untracked changes in the returned patch.
+
 ## 评论 API
 
 评论由根讨论和回复两种状态组成。只有根讨论拥有行锚点和 `open` / `resolved` 状态，回复只引用父评论。
@@ -122,6 +125,10 @@ POST /api/tasks/{taskId}/diff/comments
 POST /api/tasks/{taskId}/diff/comments/{commentId}/replies
 PUT  /api/tasks/{taskId}/diff/comments/{commentId}/status
 ```
+
+Line comments and Git write operations are supported only for isolated `worktree` tasks.
+For a `project_root` task, creating a comment, committing, or pushing returns HTTP `409`
+with the `task_worktree_unavailable` error code.
 
 创建根讨论：
 
