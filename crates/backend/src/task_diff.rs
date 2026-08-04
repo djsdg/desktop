@@ -21,7 +21,7 @@ use ora_db::{
     SqliteWorktreeRepository,
 };
 use ora_domain::{Project, Task, TaskId, WorktreeActivity};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Owns task-scoped Git review operations shared by the Web and Desktop adapters.
 pub(crate) struct TaskDiffApi {
@@ -72,12 +72,12 @@ impl TaskDiffApi {
         &self,
         request: CommitTaskChangesRequest,
     ) -> Result<CommitTaskChangesResponse, BackendError> {
-        let (task, project, work_dir) = self.worktree_context(&request.task_id)?;
+        let (task, project, worktree_path) = self.worktree_context(&request.task_id)?;
         CommitTaskChangesHandler::new(
             SqliteTaskRepository::new(self.pool.clone()),
             SqliteWorktreeRepository::new(self.pool.clone()),
             GitTaskGitWriter::new(PathBuf::from(project.root_path)),
-            work_dir,
+            worktree_path,
         )
         .handle(CommitTaskChangesRequest {
             task_id: task.id.to_string(),
@@ -91,12 +91,12 @@ impl TaskDiffApi {
         &self,
         request: PushTaskBranchRequest,
     ) -> Result<PushTaskBranchResponse, BackendError> {
-        let (task, project, work_dir) = self.worktree_context(&request.task_id)?;
+        let (task, project, worktree_path) = self.worktree_context(&request.task_id)?;
         PushTaskBranchHandler::new(
             SqliteTaskRepository::new(self.pool.clone()),
             SqliteWorktreeRepository::new(self.pool.clone()),
             GitTaskGitWriter::new(PathBuf::from(project.root_path)),
-            work_dir,
+            worktree_path,
         )
         .handle(PushTaskBranchRequest {
             task_id: task.id.to_string(),
@@ -122,7 +122,7 @@ impl TaskDiffApi {
         &self,
         request: CreateTaskDiffCommentRequest,
     ) -> Result<CreateTaskDiffCommentResponse, BackendError> {
-        let (task, project, work_dir) = self.worktree_context(&request.task_id)?;
+        let (task, project, worktree_path) = self.worktree_context(&request.task_id)?;
         CreateTaskDiffCommentHandler::new(
             SqliteTaskRepository::new(self.pool.clone()),
             SqliteWorktreeRepository::new(self.pool.clone()),
@@ -130,7 +130,7 @@ impl TaskDiffApi {
             SqliteTaskDiffCommentRepository::new(self.pool.clone()),
             UuidTaskDiffCommentIdGenerator::new(),
             self.clock,
-            work_dir,
+            worktree_path,
         )
         .handle(CreateTaskDiffCommentRequest {
             task_id: task.id.to_string(),
@@ -246,14 +246,7 @@ impl TaskDiffApi {
         }
         let project = self.load_project(&task)?;
         let cwd = resolve_task_cwd(&self.pool, &task_id)?;
-        let work_dir = cwd.parent().map(Path::to_path_buf).ok_or_else(|| {
-            BackendError::new(
-                ErrorClassification::Internal,
-                PublicError::InternalError(EmptyErrorParams {}),
-                "task worktree parent directory is unavailable",
-            )
-        })?;
-        Ok((task, project, work_dir))
+        Ok((task, project, cwd))
     }
 }
 
